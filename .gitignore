@@ -1,9 +1,6 @@
 # Environment variables (contains API keys — never commit)
 .env
 
-# Generated data files (run the pipeline to regenerate)
-data/
-
 # Python cache
 __pycache__/
 *.pyc
@@ -18,6 +15,9 @@ env/
 
 # Streamlit cache
 .streamlit/
+
+# Claude Code settings (local only)
+.claude/
 
 # macOS
 .DS_Store
