@@ -181,11 +181,9 @@ def classify_news_pipeline(news_df):
 def main():
     """Run the complete data pipeline."""
     print("""
-    ╔════════════════════════════════════════════════════════════════╗
-    ║                                                                ║
-    ║          FINANCIAL STRESS MONITOR - DATA PIPELINE              ║
-    ║                                                                ║
-    ╚════════════════════════════════════════════════════════════════╝
+    ================================================================
+              FINANCIAL STRESS MONITOR - DATA PIPELINE
+    ================================================================
     """)
 
     # Check environment

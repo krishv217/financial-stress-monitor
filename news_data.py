@@ -142,23 +142,29 @@ def fetch_nyt_headlines(query=None, days_back=30, max_pages=10):
     page = 0
 
     while page < max_pages:
-        print(f"  Fetching NYT page {page + 1}/{max_pages} ({from_date} → {to_date})...")
+        print(f"  Fetching NYT page {page + 1}/{max_pages} ({from_date} to {to_date})...")
 
         params = {
             'q': query,
             'begin_date': from_date,
             'end_date': to_date,
-            'sort': 'newest',
             'page': page,
             'api-key': NYT_API_KEY,
         }
 
         try:
             response = requests.get(NYT_BASE_URL, params=params)
+
+            # Handle HTTP 429 before raise_for_status so we can retry
+            if response.status_code == 429:
+                print(f"  NYT rate limit (HTTP 429). Waiting 60s...")
+                time.sleep(60)
+                continue  # retry same page (page not incremented)
+
             response.raise_for_status()
             data = response.json()
 
-            # Rate-limit fault has no 'status' key — detect and retry same page
+            # Rate-limit fault returned as 200 with fault body — detect and retry
             if 'fault' in data:
                 fault_msg = data['fault'].get('faultstring', 'Rate limit exceeded')
                 print(f"  NYT rate limit hit: {fault_msg}. Waiting 60s...")
@@ -166,7 +172,8 @@ def fetch_nyt_headlines(query=None, days_back=30, max_pages=10):
                 continue  # retry same page (page not incremented)
 
             if data.get('status') != 'OK':
-                print(f"  NYT API error: {data.get('message', 'Unknown error')}")
+                print(f"  NYT API error: {data.get('status')} — {data.get('message', 'Unknown error')}")
+                print(f"  Raw response: {data}")
                 break
 
             resp_body = data.get('response') or {}
@@ -174,6 +181,7 @@ def fetch_nyt_headlines(query=None, days_back=30, max_pages=10):
             total_hits = (resp_body.get('metadata') or {}).get('hits', 0)
 
             if not docs:
+                print(f"  No docs returned (total_hits={total_hits}). Raw response body: {resp_body}")
                 break
 
             for doc in docs:
@@ -213,7 +221,7 @@ def fetch_nyt_headlines(query=None, days_back=30, max_pages=10):
     df = df.sort_values('date', ascending=False)
 
     print(f"Fetched {len(df)} articles from NYT "
-          f"({df['date'].min().date()} → {df['date'].max().date()})")
+          f"({df['date'].min().date()} to {df['date'].max().date()})")
     return df
 
 
