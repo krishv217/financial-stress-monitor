@@ -1,6 +1,7 @@
 """
 News Data Module
-Fetches financial news from NewsAPI (recent) and GDELT (historical)
+Fetches financial news from the NYT Article Search API (recent + historical)
+and GDELT (supplemental historical coverage)
 """
 
 import os
@@ -13,9 +14,17 @@ from gdeltdoc import GdeltDoc, Filters
 
 load_dotenv()
 
-NEWS_API_KEY = os.getenv('NEWS_API_KEY')
+NYT_API_KEY = os.getenv('NYT_API_KEY')
+NYT_BASE_URL = 'https://api.nytimes.com/svc/search/v2/articlesearch.json'
 
-# Financial stress keywords for querying
+# Combined financial stress query (OR logic, efficient for NYT's single-call pagination)
+NYT_FINANCIAL_QUERY = (
+    '"federal reserve" OR inflation OR recession OR "yield curve" OR '
+    '"credit crisis" OR "banking stress" OR "financial markets" OR '
+    '"interest rates" OR "stock market" OR "liquidity crisis"'
+)
+
+# Financial stress keywords for querying (used by GDELT)
 FINANCIAL_KEYWORDS = [
     'federal reserve',
     'inflation',
@@ -102,6 +111,110 @@ def fetch_newsapi_headlines(keywords=None, days_back=30, language='en', page_siz
 
     except requests.exceptions.RequestException as e:
         raise Exception(f"Error fetching NewsAPI data: {e}")
+
+
+def fetch_nyt_headlines(query=None, days_back=30, max_pages=10):
+    """
+    Fetch financial news headlines from the NYT Article Search API.
+
+    Uses a single combined OR query and paginates through results.
+    Rate limit: 5 requests/minute — enforced via 12-second sleep between pages.
+    Archive coverage: 1851 to present (far better historical depth than NewsAPI).
+
+    Args:
+        query: NYT search query string (default: NYT_FINANCIAL_QUERY)
+        days_back: How many days back to search (NYT archive supports any range)
+        max_pages: Maximum pages to fetch (10 results per page)
+
+    Returns:
+        pandas DataFrame with columns: date, headline, source, url
+    """
+    if not NYT_API_KEY:
+        raise ValueError("NYT_API_KEY not found in environment variables")
+
+    if query is None:
+        query = NYT_FINANCIAL_QUERY
+
+    from_date = (datetime.now() - timedelta(days=days_back)).strftime('%Y%m%d')
+    to_date = datetime.now().strftime('%Y%m%d')
+
+    all_articles = []
+    page = 0
+
+    while page < max_pages:
+        print(f"  Fetching NYT page {page + 1}/{max_pages} ({from_date} → {to_date})...")
+
+        params = {
+            'q': query,
+            'begin_date': from_date,
+            'end_date': to_date,
+            'sort': 'newest',
+            'page': page,
+            'api-key': NYT_API_KEY,
+        }
+
+        try:
+            response = requests.get(NYT_BASE_URL, params=params)
+            response.raise_for_status()
+            data = response.json()
+
+            # Rate-limit fault has no 'status' key — detect and retry same page
+            if 'fault' in data:
+                fault_msg = data['fault'].get('faultstring', 'Rate limit exceeded')
+                print(f"  NYT rate limit hit: {fault_msg}. Waiting 60s...")
+                time.sleep(60)
+                continue  # retry same page (page not incremented)
+
+            if data.get('status') != 'OK':
+                print(f"  NYT API error: {data.get('message', 'Unknown error')}")
+                break
+
+            resp_body = data.get('response') or {}
+            docs = resp_body.get('docs') or []
+            total_hits = (resp_body.get('metadata') or {}).get('hits', 0)
+
+            if not docs:
+                break
+
+            for doc in docs:
+                headline = doc.get('headline', {}).get('main', '')
+                if headline:
+                    all_articles.append({
+                        'date': pd.to_datetime(doc.get('pub_date')),
+                        'headline': headline,
+                        'source': 'New York Times',
+                        'url': doc.get('web_url', ''),
+                    })
+
+            print(f"    Got {len(docs)} articles (total available: {total_hits})")
+
+            # Stop early if we have collected all available results
+            if len(all_articles) >= total_hits:
+                break
+
+            page += 1
+
+            # NYT rate limit: 5 req/min — sleep between pages
+            if page < max_pages:
+                time.sleep(12)
+
+        except requests.exceptions.RequestException as e:
+            print(f"  Error fetching NYT data: {e}")
+            break
+
+    if not all_articles:
+        print("No articles found from NYT")
+        return pd.DataFrame(columns=['date', 'headline', 'source', 'url'])
+
+    df = pd.DataFrame(all_articles)
+    df = df.dropna(subset=['headline'])
+    df = df[df['headline'] != '']
+    df = df.drop_duplicates(subset=['headline'])
+    df = df.sort_values('date', ascending=False)
+
+    print(f"Fetched {len(df)} articles from NYT "
+          f"({df['date'].min().date()} → {df['date'].max().date()})")
+    return df
 
 
 def fetch_gdelt_headlines(keywords=None, start_date='2015-01-01', end_date=None, max_records=5000):

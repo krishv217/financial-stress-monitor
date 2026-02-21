@@ -23,7 +23,8 @@ from analysis import (
     align_fred_weekly,
     calculate_lead_lag_correlation,
     detect_divergence,
-    generate_analysis_summary
+    generate_analysis_summary,
+    fit_narrative_to_fred_regression,
 )
 
 # Page configuration
@@ -220,6 +221,12 @@ def main():
         st.error("Cannot proceed without FRED data.")
         return
 
+    # Fit narrative→FRED regression using full (unfiltered) history
+    full_fred_df_raw, full_news_df_raw = load_all_data()
+    _reg_news_weekly = aggregate_news_by_week(full_news_df_raw) if not full_news_df_raw.empty else pd.DataFrame()
+    _reg_fred_weekly = align_fred_weekly(full_fred_df_raw) if not full_fred_df_raw.empty else pd.DataFrame()
+    reg_params = fit_narrative_to_fred_regression(_reg_news_weekly, _reg_fred_weekly)
+
     # Sidebar filters
     st.sidebar.header("Filters")
 
@@ -341,6 +348,42 @@ def main():
             </div>
             """, unsafe_allow_html=True)
 
+    # ── Calibrated FRED Forecast ──────────────────────────────────────────
+    if reg_params is not None and has_news:
+        predicted_fred = reg_params['slope'] * narrative_score + reg_params['intercept']
+        lag = reg_params['best_lag']
+        r2 = reg_params['r_squared']
+        n = reg_params['n_observations']
+
+        st.markdown("### 🔮 Calibrated FRED Forecast")
+        st.caption(
+            f"OLS regression trained on {n} weeks of aligned data · "
+            f"optimal lag = {lag} week(s) · R² = {r2:.2f}"
+        )
+
+        fc_col, fc_desc = st.columns([1, 2])
+        with fc_col:
+            forecast_class = get_stress_color(predicted_fred)
+            st.markdown(
+                f'<div class="big-metric {forecast_class}">{predicted_fred:+.4f}</div>',
+                unsafe_allow_html=True
+            )
+            st.caption(f"Estimated FRED reading in ~{lag} week(s)")
+
+        with fc_desc:
+            direction = "higher" if predicted_fred > fred_score else "lower"
+            change = predicted_fred - fred_score
+            st.markdown(
+                f"The regression model predicts the next FRED release will read **{predicted_fred:+.4f}**, "
+                f"**{abs(change):.4f} points {direction}** than the current official reading of {fred_score:.4f}."
+            )
+            if r2 < 0.25:
+                st.warning(f"Low R² ({r2:.2f}) — only {n} weeks of training data. Forecast improves as more news history is collected.")
+            elif r2 < 0.5:
+                st.info(f"Moderate fit (R²={r2:.2f}). The model explains roughly {r2*100:.0f}% of historical FRED variance.")
+            else:
+                st.success(f"Strong fit (R²={r2:.2f}). The model explains {r2*100:.0f}% of historical FRED variance.")
+
     st.divider()
 
     # =====================================================================
@@ -369,35 +412,45 @@ def main():
         marker=dict(size=8)
     ))
 
-    # Daily prediction points for the gap — only days that have article data
+    # Daily prediction points for the gap — calibrated to FRED scale via regression
     if not preds_with_data.empty:
-        # Scale narrative score to FRED's approximate range for visual alignment
-        fred_range = recent_12w['value'].max() - recent_12w['value'].min()
-        fred_mid = recent_12w['value'].mean()
-        scaled_scores = preds_with_data['narrative_score'] * (fred_range / 2) + fred_mid
+        if reg_params is not None:
+            # Use regression to place orange diamonds on the actual FRED scale
+            chart_scores = (
+                reg_params['slope'] * preds_with_data['narrative_score'] + reg_params['intercept']
+            )
+            score_label = "Calibrated FRED Estimate"
+        else:
+            # Fall back to ad-hoc visual scaling when no regression is available
+            fred_range = recent_12w['value'].max() - recent_12w['value'].min()
+            fred_mid = recent_12w['value'].mean()
+            chart_scores = preds_with_data['narrative_score'] * (fred_range / 2) + fred_mid
+            score_label = "Narrative Estimate (unscaled)"
 
         fig_trend.add_trace(go.Scatter(
             x=preds_with_data['date'],
-            y=scaled_scores,
+            y=chart_scores,
             mode='markers',
-            name='Daily Narrative Estimate (since last FRED)',
+            name=f'Daily {score_label} (since last FRED)',
             marker=dict(color='#ff7f0e', size=14, symbol='diamond',
                         line=dict(color='white', width=1)),
             customdata=preds_with_data[['narrative_score', 'article_count']].values,
             hovertemplate=(
                 "<b>%{x|%Y-%m-%d}</b><br>"
-                "Narrative Score: %{customdata[0]:+.3f}<br>"
+                f"{score_label}: %{{y:.4f}}<br>"
+                "Raw narrative score: %{customdata[0]:+.3f}<br>"
                 "Articles: %{customdata[1]}<br>"
                 "<i>See cards below for detail</i><extra></extra>"
             )
         ))
 
-        # Dashed connector from last FRED point to first prediction point with data
-        first_pred = preds_with_data.iloc[0]
+        # Dashed connector from last FRED point to first calibrated prediction
+        first_pred_y = chart_scores.iloc[0]
         last_fred_val = recent_12w.iloc[-1]['value']
+        first_pred = preds_with_data.iloc[0]
         fig_trend.add_trace(go.Scatter(
             x=[last_fred_date, first_pred['date']],
-            y=[last_fred_val, scaled_scores.iloc[0]],
+            y=[last_fred_val, first_pred_y],
             mode='lines',
             name='',
             line=dict(color='#ff7f0e', width=1, dash='dot'),

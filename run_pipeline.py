@@ -9,7 +9,7 @@ from datetime import datetime, timedelta
 import pandas as pd
 
 from fred_data import fetch_fred_data, save_fred_data, load_fred_data
-from news_data import fetch_newsapi_headlines, fetch_gdelt_headlines, save_news_data
+from news_data import fetch_nyt_headlines, fetch_gdelt_headlines, save_news_data
 from classifier import classify_news_dataframe
 
 
@@ -24,7 +24,7 @@ def check_environment():
     """Check if all required environment variables are set."""
     print_section("Environment Check")
 
-    required_vars = ['FRED_API_KEY', 'NEWS_API_KEY', 'ANTHROPIC_API_KEY']
+    required_vars = ['FRED_API_KEY', 'NYT_API_KEY', 'ANTHROPIC_API_KEY']
     missing = []
 
     for var in required_vars:
@@ -88,16 +88,16 @@ def fetch_news_pipeline():
 
     all_news = []
 
-    # Fetch recent news from NewsAPI
-    print("\nFetching recent news from NewsAPI (last 30 days)...")
+    # Fetch recent news from NYT Article Search API
+    print("\nFetching recent news from NYT Article Search API (last 30 days)...")
     try:
-        newsapi_df = fetch_newsapi_headlines(days_back=30)
-        if not newsapi_df.empty:
-            all_news.append(newsapi_df)
-            save_news_data(newsapi_df, 'data/news_recent.csv')
-            print(f"✓ NewsAPI: {len(newsapi_df)} articles")
+        nyt_df = fetch_nyt_headlines(days_back=30, max_pages=10)
+        if not nyt_df.empty:
+            all_news.append(nyt_df)
+            save_news_data(nyt_df, 'data/news_recent.csv')
+            print(f"✓ NYT: {len(nyt_df)} articles")
     except Exception as e:
-        print(f"✗ NewsAPI error: {e}")
+        print(f"✗ NYT error: {e}")
 
     # Fetch recent news from GDELT (last 90 days — GDELT DOC 2.0 limit)
     print("\nFetching recent news from GDELT (last 90 days)...")

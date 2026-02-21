@@ -172,6 +172,54 @@ def detect_divergence(news_weekly, fred_weekly, threshold=0.3):
     return merged
 
 
+def fit_narrative_to_fred_regression(news_weekly, fred_weekly, max_lag_weeks=4):
+    """
+    Fit OLS linear regression: FRED(t + best_lag) = slope * sentiment(t) + intercept.
+
+    Selects the lag with the highest absolute cross-correlation, then fits a
+    least-squares line over the full overlapping history at that lag.
+
+    Returns:
+        dict with keys slope, intercept, r_squared, best_lag, n_observations
+        or None if there are fewer than 5 aligned observations.
+    """
+    corr_df = calculate_lead_lag_correlation(news_weekly, fred_weekly, max_lag_weeks)
+    if corr_df.empty:
+        return None
+
+    best_lag = int(corr_df.loc[corr_df['correlation'].abs().idxmax(), 'lag_weeks'])
+
+    merged = pd.merge(news_weekly, fred_weekly, on='week_start', how='inner').sort_values('week_start')
+
+    if best_lag == 0:
+        X = merged['sentiment_score'].values
+        y = merged['fred_value'].values
+    else:
+        X = merged['sentiment_score'].values[:-best_lag]
+        y = merged['fred_value'].values[best_lag:]
+
+    mask = ~(np.isnan(X) | np.isnan(y))
+    X, y = X[mask], y[mask]
+
+    if len(X) < 5:
+        return None
+
+    slope, intercept = np.polyfit(X, y, 1)
+
+    y_pred = slope * X + intercept
+    ss_res = float(np.sum((y - y_pred) ** 2))
+    ss_tot = float(np.sum((y - np.mean(y)) ** 2))
+    r_squared = (1 - ss_res / ss_tot) if ss_tot > 0 else 0.0
+
+    return {
+        'slope': float(slope),
+        'intercept': float(intercept),
+        'r_squared': r_squared,
+        'best_lag': best_lag,
+        'n_observations': int(len(X)),
+    }
+
+
 def generate_analysis_summary(corr_df):
     """
     Generate plain English summary of correlation analysis.
