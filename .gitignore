@@ -19,5 +19,8 @@ env/
 # Streamlit cache
 .streamlit/
 
+# Claude Code settings (local only)
+.claude/
+
 # macOS
 .DS_Store
