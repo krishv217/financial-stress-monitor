@@ -52,7 +52,7 @@ QUERIES = [
     'stock market OR market volatility OR financial markets', # Q10 equity/broad
 ]
 
-START_DATE = datetime(2025, 8, 1)
+START_DATE = datetime(2024, 12, 30)  # Monday of week containing 12/31/24
 RAW_CSV = 'data/raw_articles.csv'
 FIELDNAMES = [
     'article_id', 'source', 'query_number', 'week_start',
@@ -65,11 +65,11 @@ FIELDNAMES = [
 # ---------------------------------------------------------------------------
 
 def get_target_weeks():
-    """Generate bi-weekly Monday dates from START_DATE through today."""
+    """Generate weekly Monday dates from START_DATE through today."""
     weeks, d, today = [], START_DATE, datetime.now()
     while d <= today:
         weeks.append(d)
-        d += timedelta(weeks=2)
+        d += timedelta(weeks=1)
     return weeks
 
 

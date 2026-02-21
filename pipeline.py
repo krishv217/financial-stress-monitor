@@ -4,7 +4,7 @@ Data Pipeline — Phases 2-4
 Phase 2: Dedup + relevance filter -> classified_articles.csv (is_relevant)
 Phase 3: LLM classification -> classified_articles.csv (theme/direction/magnitude)
 Phase 4: Weekly aggregation -> weekly_sentiment_scores.csv
-         Populate fred_score_2w_future for all historical weeks
+         Populate fred_score_{1w,2w,4w,8w,12w}_future for all historical weeks
 
 Usage:
   python pipeline.py              # run all phases
@@ -16,6 +16,7 @@ Usage:
 
 import os
 import csv
+import json
 import argparse
 import unicodedata
 import re
@@ -36,14 +37,25 @@ CLASSIFIED_FIELDS = [
     'article_id', 'source', 'query_number', 'week_start',
     'publication_date', 'headline', 'abstract', 'section', 'url',
     'is_relevant', 'stress_theme', 'stress_direction',
-    'magnitude_score', 'prompt_version',
+    'magnitude_score', 'stress_themes', 'prompt_version',
 ]
 
 WEEKLY_FIELDS = [
-    'week_start', 'fred_score', 'fred_score_2w_future',
+    'week_start', 'fred_score',
+    'fred_score_1w_future', 'fred_score_2w_future', 'fred_score_4w_future',
+    'fred_score_8w_future', 'fred_score_12w_future',
     'monetary_policy_score', 'credit_debt_score',
     'banking_liquidity_score', 'inflation_growth_score',
     'geopolitical_external_score', 'total_articles', 'prompt_version',
+]
+
+# (horizon_label, weeks_ahead, column_name)
+FUTURE_HORIZONS = [
+    ('1w',  1,  'fred_score_1w_future'),
+    ('2w',  2,  'fred_score_2w_future'),
+    ('4w',  4,  'fred_score_4w_future'),
+    ('8w',  8,  'fred_score_8w_future'),
+    ('12w', 12, 'fred_score_12w_future'),
 ]
 
 THEME_COLUMNS = {
@@ -149,6 +161,10 @@ def run_phase3(prompt_ver=PROMPT_VERSION):
 
     df = pd.read_csv(CLASSIFIED_CSV, dtype=str).fillna('')
 
+    # Ensure stress_themes column exists for older CSV files
+    if 'stress_themes' not in df.columns:
+        df['stress_themes'] = ''
+
     # Articles that are relevant but not yet classified (or need reclassification)
     to_classify = df[
         (df['is_relevant'] == 'yes') &
@@ -161,14 +177,16 @@ def run_phase3(prompt_ver=PROMPT_VERSION):
         return
 
     articles = to_classify[['article_id', 'headline', 'abstract']].to_dict('records')
-    cls_map = classify_articles(articles, batch_size=20)
+    cls_map = classify_articles(articles, batch_size=10)
 
-    # Update DataFrame
-    for art_id, cls in cls_map.items():
+    # Update DataFrame — store all themes as JSON, primary theme as top-level columns
+    for art_id, cls_list in cls_map.items():
         mask = df['article_id'] == art_id
-        df.loc[mask, 'stress_theme'] = cls['theme']
-        df.loc[mask, 'stress_direction'] = cls['direction']
-        df.loc[mask, 'magnitude_score'] = str(cls['magnitude'])
+        primary = max(cls_list, key=lambda c: c['magnitude'])
+        df.loc[mask, 'stress_theme'] = primary['theme']
+        df.loc[mask, 'stress_direction'] = primary['direction']
+        df.loc[mask, 'magnitude_score'] = str(primary['magnitude'])
+        df.loc[mask, 'stress_themes'] = json.dumps(cls_list)
         df.loc[mask, 'prompt_version'] = prompt_ver
 
     df.to_csv(CLASSIFIED_CSV, index=False)
@@ -182,20 +200,39 @@ def run_phase3(prompt_ver=PROMPT_VERSION):
 def _magnitude_weighted_score(group, theme):
     """
     Magnitude-weighted net stress score for one theme within a weekly group.
+    Reads multi-theme JSON (stress_themes) so each article can contribute to
+    multiple themes. Falls back to single-theme columns for older rows.
     +magnitude for increasing, -magnitude for decreasing, 0 for neutral.
     """
-    theme_arts = group[group['stress_theme'] == theme]
     score = 0
-    for _, row in theme_arts.iterrows():
-        try:
-            mag = int(row['magnitude_score']) if row['magnitude_score'] else 1
-        except (ValueError, TypeError):
-            mag = 1
-        direction = row['stress_direction']
-        if direction == 'increasing':
-            score += mag
-        elif direction == 'decreasing':
-            score -= mag
+    for _, row in group.iterrows():
+        themes_json = row.get('stress_themes', '')
+        if themes_json:
+            try:
+                cls_list = json.loads(themes_json)
+            except (json.JSONDecodeError, TypeError):
+                cls_list = None
+        else:
+            cls_list = None
+
+        # Fall back to single-theme columns if no JSON
+        if not cls_list:
+            cls_list = [{'theme': row.get('stress_theme', ''),
+                         'direction': row.get('stress_direction', 'neutral'),
+                         'magnitude': row.get('magnitude_score', 1)}]
+
+        for cls in cls_list:
+            if cls.get('theme') != theme:
+                continue
+            try:
+                mag = max(1, min(3, int(cls.get('magnitude', 1))))
+            except (ValueError, TypeError):
+                mag = 1
+            direction = cls.get('direction', 'neutral')
+            if direction == 'increasing':
+                score += mag
+            elif direction == 'decreasing':
+                score -= mag
     return score
 
 
@@ -252,10 +289,12 @@ def run_phase4(prompt_ver=PROMPT_VERSION):
         row = {
             'week_start': week_start,
             'fred_score': _nearest_fred(fred_series, week_start),
-            'fred_score_2w_future': '',   # filled in below
             'prompt_version': prompt_ver,
             'total_articles': len(group),
         }
+        # Initialise all future horizon columns (filled in below)
+        for _, _, col in FUTURE_HORIZONS:
+            row[col] = ''
         for theme, col in THEME_COLUMNS.items():
             row[col] = _magnitude_weighted_score(group, theme)
         weekly_rows.append(row)
@@ -263,11 +302,12 @@ def run_phase4(prompt_ver=PROMPT_VERSION):
     # Sort by date
     weekly_rows.sort(key=lambda r: r['week_start'])
 
-    # Populate fred_score_2w_future using nearest-date lookup 2 weeks ahead
+    # Populate all future FRED horizon columns
     for row in weekly_rows:
         d = datetime.strptime(row['week_start'], '%Y-%m-%d')
-        future_str = (d + timedelta(weeks=2)).strftime('%Y-%m-%d')
-        row['fred_score_2w_future'] = _nearest_fred(fred_series, future_str)
+        for _, weeks_ahead, col in FUTURE_HORIZONS:
+            future_str = (d + timedelta(weeks=weeks_ahead)).strftime('%Y-%m-%d')
+            row[col] = _nearest_fred(fred_series, future_str)
 
     # Write weekly_sentiment_scores.csv (full overwrite on each aggregation run)
     with open(WEEKLY_CSV, 'w', newline='', encoding='utf-8') as f:
@@ -276,8 +316,9 @@ def run_phase4(prompt_ver=PROMPT_VERSION):
         writer.writerows(weekly_rows)
 
     print(f'Wrote {len(weekly_rows)} weeks to {WEEKLY_CSV}')
-    filled = sum(1 for r in weekly_rows if r['fred_score_2w_future'] != '')
-    print(f'fred_score_2w_future populated for {filled}/{len(weekly_rows)} weeks')
+    for label, _, col in FUTURE_HORIZONS:
+        filled = sum(1 for r in weekly_rows if r[col] != '')
+        print(f'  {col}: {filled}/{len(weekly_rows)} weeks populated')
     print('Phase 4 complete.')
 
 

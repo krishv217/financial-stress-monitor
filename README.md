@@ -1,276 +1,227 @@
-# Financial Stress Monitor 📊
+# Financial Stress Monitor
 
-A real-time dashboard that monitors financial stress by combining the St. Louis Fed Financial Stress Index (FRED STLFSI4) with LLM-classified news sentiment to detect narrative-reality divergences.
+A data pipeline and ML system that predicts the St. Louis Fed Financial Stress Index (FRED STLFSI4) using LLM-classified NYT news sentiment. Models are trained across 5 prediction horizons (1–12 weeks) using Linear Regression, Lasso, and Random Forest.
 
 ## Overview
 
-This system analyzes whether news narrative about financial stress leads, lags, or diverges from actual measured stress in the financial system. It uses Claude AI to classify news headlines by stress theme and direction, then correlates this with the FRED stress index.
-
-## Features
-
-- **Real-time FRED Stress Monitoring**: Fetches and displays the latest STLFSI4 financial stress index
-- **AI-Powered News Classification**: Uses Claude API to classify headlines by stress theme and sentiment direction
-- **Lead-Lag Analysis**: Calculates cross-correlations to identify if news sentiment predicts FRED movements
-- **Divergence Detection**: Highlights periods when narrative and reality diverge
-- **Interactive Dashboard**: Streamlit-based visualization with multiple analytical views
+The system collects NYT articles related to financial stress, classifies them by theme and direction using Claude AI, aggregates weekly sentiment scores, and trains ML models to predict future FRED stress index values. The core research question: **how far into the future can news-derived sentiment predict measurable financial stress?**
 
 ## Project Structure
 
 ```
 financial-stress-monitor/
-├── fred_data.py          # FRED API integration
-├── news_data.py          # NewsAPI and GDELT integration
-├── classifier.py         # Claude AI headline classification
-├── analysis.py           # Lead-lag correlation analysis
+├── collect_nyt.py        # Phase 1: NYT Article Search API collection
+├── pipeline.py           # Phases 2-4: dedup, relevance filter, classify, aggregate
+├── classifier.py         # Claude AI relevance filter + multi-theme classification
+├── fred_data.py          # FRED API integration (STLFSI4)
+├── train_model.py        # Phase 6: multi-horizon ML training + comparison
 ├── app.py                # Streamlit dashboard
-├── run_pipeline.py       # Complete data pipeline runner
 ├── requirements.txt      # Python dependencies
 ├── .env.example          # API key template
-├── .gitignore           # Git ignore rules
-└── data/                # Data storage (CSV files)
-    ├── fred_historical.csv
-    ├── news_recent.csv
-    ├── news_historical.csv
-    └── news_classified.csv
+├── .gitignore
+└── data/
+    ├── raw_articles.csv              # Raw NYT articles (Phase 1 output)
+    ├── classified_articles.csv       # Deduped, filtered, classified articles
+    ├── weekly_sentiment_scores.csv   # Weekly aggregated scores + FRED targets
+    ├── fred_historical.csv           # FRED STLFSI4 time series
+    ├── model_predictions.csv         # Current-week predictions
+    ├── model.pkl                     # Best 2w model (dashboard use)
+    └── model_{horizon}_{name}.pkl    # Best model per horizon (e.g. model_4w_randomforest.pkl)
 ```
 
-## Setup Instructions
+## Setup
 
-### 1. Prerequisites
+### Prerequisites
 
-- Python 3.8 or higher
-- API keys for:
-  - FRED (St. Louis Fed)
-  - NewsAPI
-  - Anthropic Claude
+- Python 3.8+
+- API keys for FRED, Anthropic, and NYT (up to 7 keys supported)
 
-### 2. Installation
+### Installation
 
 ```bash
-# Navigate to project directory
 cd financial-stress-monitor
-
-# Install dependencies
 pip install -r requirements.txt
 ```
 
-### 3. API Key Configuration
+### API Key Configuration
 
-1. Copy the example environment file:
+Copy the example file and fill in your keys:
+
 ```bash
 cp .env.example .env
 ```
 
-2. Edit `.env` and add your API keys:
+`.env` format:
 ```
-FRED_API_KEY=your_fred_api_key_here
-NEWS_API_KEY=your_newsapi_key_here
-ANTHROPIC_API_KEY=your_anthropic_api_key_here
+FRED_API_KEY=your_fred_key
+ANTHROPIC_API_KEY=your_anthropic_key
+
+NYT_API_KEY_1=your_nyt_key_1
+NYT_API_KEY_2=your_nyt_key_2
+# ... up to NYT_API_KEY_7
 ```
 
-#### Getting API Keys
+**FRED API key:** [fred.stlouisfed.org](https://fred.stlouisfed.org) → My Account → API Keys
 
-**FRED API Key:**
-- Create a free account at [https://fred.stlouisfed.org](https://fred.stlouisfed.org)
-- Navigate to "My Account" → "API Keys"
-- Request an API key
+**Anthropic API key:** [console.anthropic.com](https://console.anthropic.com) → API Keys
 
-**NewsAPI Key:**
-- Create a free account at [https://newsapi.org](https://newsapi.org)
-- Find your API key in the dashboard
-- Note: Free tier limited to 30 days of historical data
+**NYT API keys:** [developer.nytimes.com](https://developer.nytimes.com) → Apps → Create App
+- Each key allows ~4,000 calls/day (IP-level shared quota)
+- Multiple keys rotate automatically with a 1-second floor between calls
 
-**Anthropic API Key:**
-- Sign up at [https://console.anthropic.com](https://console.anthropic.com)
-- Navigate to API Keys section
-- Generate a new key
+---
 
-### 4. Initial Data Collection
+## Pipeline
 
-Run the complete data pipeline to collect historical data:
+Run each phase in order, or run all at once:
+
+### Phase 1 — Collect NYT Articles
 
 ```bash
-python run_pipeline.py
+python collect_nyt.py
 ```
 
-This will:
-1. Fetch FRED historical data (2015-present)
-2. Fetch recent news from NewsAPI (last 30 days)
-3. Fetch historical news from GDELT (2015-present)
-4. Classify all headlines using Claude AI
-5. Save processed data to CSV files
+Collects articles from 10 financial stress queries going backwards from the most recent week. Outputs to `data/raw_articles.csv`. Supports up to 7 rotating API keys.
 
-**Note:** The initial run may take 15-30 minutes depending on the amount of data and API rate limits.
+- Queries cover: monetary policy, credit/debt, banking/liquidity, inflation/growth, geopolitical risk
+- Per-query page limits: Q1–Q4, Q9–Q10 = 2 pages; Q5–Q8 = 1 page (16 API calls/week)
+- At ~4,000 calls/day, processes roughly 250 weeks/day
 
-## Usage
-
-### Testing Individual Modules
-
-Test each module independently:
+### Phase 2 — Dedup + Relevance Filter
 
 ```bash
-# Test FRED data fetching
-python fred_data.py
-
-# Test news data fetching
-python news_data.py
-
-# Test headline classification
-python classifier.py
-
-# Test analysis functions
-python analysis.py
+python pipeline.py --phase 2
 ```
 
-### Running the Dashboard
+Deduplicates articles by normalized headline, then uses Claude AI in batches of 30 to filter for financial stress relevance. Outputs to `data/classified_articles.csv`.
 
-Start the Streamlit dashboard:
+### Phase 3 — LLM Multi-Theme Classification
+
+```bash
+python pipeline.py --phase 3
+```
+
+Classifies each relevant article into 1–3 stress themes with direction (increasing/decreasing/neutral) and magnitude (1–3). Uses Claude Haiku in batches of 10.
+
+**Themes:**
+- `monetary_policy_risk` — Fed policy, interest rates, tightening/easing
+- `credit_debt_risk` — corporate/consumer debt, defaults, spreads
+- `banking_liquidity_risk` — bank stress, deposit flows, liquidity crises
+- `inflation_growth_risk` — CPI, GDP, recession signals
+- `geopolitical_external_risk` — trade wars, sanctions, global shocks
+
+### Phase 4 — Weekly Aggregation
+
+```bash
+python pipeline.py --phase 4
+```
+
+Groups classified articles by week and computes magnitude-weighted net sentiment scores per theme. Populates 5 future FRED score columns via nearest-date lookup.
+
+**FRED horizon columns written:**
+| Column | Offset |
+|---|---|
+| `fred_score_1w_future` | +1 week |
+| `fred_score_2w_future` | +2 weeks |
+| `fred_score_4w_future` | +4 weeks |
+| `fred_score_8w_future` | +8 weeks |
+| `fred_score_12w_future` | +12 weeks |
+
+### Run All Phases
+
+```bash
+python pipeline.py
+# or with a specific prompt version:
+python pipeline.py --prompt-version v2
+```
+
+---
+
+## ML Training
+
+```bash
+python train_model.py
+```
+
+Trains **3 models × 5 horizons = 15 combinations** and prints a comparison table:
+
+```
+Horizon  Model             Train rows  Test rows  Train R²   Test R²     RMSE      MAE
+----------------------------------------------------------------------------------------
+1w       LinearRegression        ...        ...     0.xxx     0.xxx    0.xxxx   0.xxxx
+1w       LassoCV                 ...        ...     0.xxx     0.xxx    0.xxxx   0.xxxx
+1w       RandomForest            ...        ...     0.xxx     0.xxx    0.xxxx   0.xxxx
+2w       ...
+```
+
+**Models:**
+- `LinearRegression` — OLS baseline
+- `LassoCV` — L1-regularized regression with automatic alpha selection (5-fold CV); can zero out uninformative features
+- `RandomForest` — 100-tree ensemble, captures non-linear interactions
+
+**Features:** `monetary_policy_score`, `credit_debt_score`, `banking_liquidity_score`, `inflation_growth_score`, `geopolitical_external_score`, `fred_score`
+
+**Train/test split:** chronological 80/20
+
+The best model per horizon (by test R²) is saved to `data/model_{horizon}_{name}.pkl`. The best 2-week model is also saved to `data/model.pkl` for dashboard use.
+
+**Options:**
+```bash
+python train_model.py --eval              # print table only, no save
+python train_model.py --horizon 2w 4w    # train specific horizons only
+```
+
+---
+
+## Dashboard
 
 ```bash
 streamlit run app.py
 ```
 
-The dashboard will open in your browser at `http://localhost:8501`
+Opens at `http://localhost:8501`
 
-### Dashboard Sections
-
-1. **Current Stress Indicator**: Shows the latest FRED stress score with color-coded status
-2. **12-Week Trend**: Line chart of recent stress index movements
-3. **Current Narrative Sentiment**: Breakdown of recent news by theme and direction
-4. **Divergence Indicator**: Dual-axis chart showing when news sentiment diverges from FRED
-5. **Historical Lead-Lag Analysis**: Correlation analysis showing if news predicts FRED movements
-
-## Data Pipeline
-
-### Module Descriptions
-
-**fred_data.py**
-- Fetches STLFSI4 time series from FRED API
-- Handles date parsing and data cleaning
-- Saves to CSV for offline analysis
-
-**news_data.py**
-- Fetches recent headlines from NewsAPI (last 30 days)
-- Fetches historical headlines from GDELT (2015-present)
-- Standardizes output format across sources
-- Uses predefined financial stress keywords
-
-**classifier.py**
-- Batches headlines for efficient API usage (20 per call)
-- Uses structured prompts to get JSON responses
-- Classifies by theme: credit_risk, inflation_risk, liquidity_risk, geopolitical_risk, banking_risk, none
-- Classifies by direction: increasing, decreasing, neutral
-
-**analysis.py**
-- Aggregates daily news to weekly frequency
-- Aligns news and FRED data by week
-- Calculates cross-correlations at 0-4 week lags
-- Detects divergence periods
-- Generates plain English summaries
-
-**app.py**
-- Streamlit dashboard with 4 main sections
-- Interactive filtering by date range
-- Real-time divergence alerts
-- Cached data loading for performance
+---
 
 ## Key Design Decisions
 
-### Why CSV instead of Database?
-For a 36-hour hackathon timeline, CSV files provide:
-- Zero setup overhead
-- Easy inspection and debugging
-- Sufficient performance for this data scale
-- Simple version control and sharing
+**Weekly aggregation** — FRED publishes weekly; weekly grouping reduces noise and aligns prediction targets naturally.
 
-### Why Weekly Aggregation?
-- FRED data is published weekly
-- Reduces noise in daily news cycles
-- More stable correlation analysis
-- Aligns with typical financial reporting cycles
+**Multi-theme classification** — Each article can contribute to 1–3 themes, preventing misattribution when an article spans multiple risk categories. Primary theme (highest magnitude) is stored in flat columns; full list stored as JSON in `stress_themes`.
 
-### Why Batch Classification?
-- Reduces API costs (fewer calls)
-- Improves throughput (20 headlines per call)
-- Maintains Claude's context for consistent classification
-- Includes rate limiting to avoid throttling
+**Magnitude-weighted scoring** — Net score per theme = sum of (+magnitude for increasing, −magnitude for decreasing) across all articles in the week. Neutral articles contribute 0.
+
+**5 prediction horizons** — Allows comparison of short-term (1–2w) vs medium-term (4–12w) predictability, which is the core research question.
+
+**Nearest-date FRED lookup** — FRED publishes on Fridays; article weeks may start on any day. A ±10-day nearest-match prevents missed joins.
+
+**Backwards collection** — Articles are collected from most recent week backwards, so if the daily quota is exhausted, the most recent (most relevant) data is collected first.
+
+---
 
 ## Troubleshooting
 
-### "API Key not found" errors
-- Ensure `.env` file exists in the project root
-- Check that variable names match exactly: `FRED_API_KEY`, `NEWS_API_KEY`, `ANTHROPIC_API_KEY`
-- No quotes needed around values in `.env`
+**NYT 429 rate limit errors**
+- All keys from the same IP share a ~4,000 call/day quota
+- Wait for midnight ET reset, or have a group member collect from a different network
 
-### NewsAPI "426 Upgrade Required"
-- Free tier only provides 30 days of history
-- Use GDELT for older data
-- Consider upgrading NewsAPI plan if needed
+**`classified_articles.csv` missing `stress_themes` column**
+- Older rows from before v2 classifier will have an empty `stress_themes` field
+- Phase 4 aggregation falls back to single-theme columns for those rows
 
-### GDELT timeouts or errors
-- GDELT can be slow for large date ranges
-- Try smaller date ranges or fewer keywords
-- The library sometimes has rate limits - add delays between calls
+**FRED values missing for recent weeks**
+- FRED data is fetched up to the current date; the most recent 1–12 weeks will have empty future columns since those FRED readings don't exist yet
+- These rows are excluded from ML training (no target label) but can be predicted by the model
 
-### Classification produces "none/neutral" for everything
-- Check Anthropic API key validity
-- Review Claude API usage limits
-- Inspect the raw API response in classifier.py debug output
-- Prompt may need tuning for specific news sources
+**`model.pkl` not found when running dashboard**
+- Run `python train_model.py` after completing pipeline phases 2–4
 
-### Streamlit dashboard shows "File not found"
-- Run `python run_pipeline.py` first to generate data files
-- Check that `data/` directory exists
-- Verify CSV files are not empty
-
-## Extending the System
-
-### Adding New News Sources
-1. Create fetch function in `news_data.py`
-2. Return standardized DataFrame format (date, headline, source, url)
-3. Update `run_pipeline.py` to include new source
-
-### Adding New Stress Themes
-1. Update `STRESS_THEMES` list in `classifier.py`
-2. Update classification prompt with new theme definition
-3. Re-run classification on historical data
-
-### Adding New Visualizations
-1. Add new section in `app.py`
-2. Use Plotly for interactive charts
-3. Follow existing pattern: data processing → visualization → insights
-
-## Performance Optimization
-
-- **Caching**: Streamlit caches data loading (1 hour TTL)
-- **Batch Processing**: Headlines classified in groups of 20
-- **Incremental Updates**: Only fetch new data since last run
-- **Local Storage**: CSV files avoid repeated API calls during development
-
-## Team Workflow Recommendation
-
-**Person 1 - Data Pipeline:**
-- Own `fred_data.py`, `news_data.py`, `run_pipeline.py`
-- Focus on data quality and API reliability
-
-**Person 2 - Analysis & Classification:**
-- Own `classifier.py`, `analysis.py`
-- Tune LLM prompts and correlation methods
-
-**Person 3 - Frontend:**
-- Own `app.py`
-- Focus on visualization and user experience
+---
 
 ## Credits
 
-Built with:
-- [Streamlit](https://streamlit.io) - Dashboard framework
-- [Plotly](https://plotly.com) - Interactive visualizations
-- [Claude API](https://anthropic.com) - LLM classification
-- [FRED](https://fred.stlouisfed.org) - Financial stress data
-- [NewsAPI](https://newsapi.org) - Recent news data
-- [GDELT](https://gdeltproject.org) - Historical news data
-
-## License
-
-MIT License - feel free to use and modify for your projects.
+- [FRED STLFSI4](https://fred.stlouisfed.org/series/STLFSI4) — St. Louis Fed Financial Stress Index
+- [NYT Article Search API](https://developer.nytimes.com/docs/articlesearch-product/1/overview) — News source
+- [Claude API](https://anthropic.com) — LLM classification (Haiku)
+- [Streamlit](https://streamlit.io) — Dashboard framework
+- [scikit-learn](https://scikit-learn.org) — ML models
