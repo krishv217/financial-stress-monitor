@@ -1,258 +1,279 @@
 """
-LLM Classification Module
-Uses Claude API to classify news headlines by stress theme and direction
+LLM Classification Module — Pipeline v2
+
+Handles two classification tasks:
+  1. Relevance filter  — is this article about macro/financial markets? (yes/no)
+  2. Stress classifier — theme (5 categories) + direction + magnitude (1-3)
+
+Also retains the legacy classify_news_dataframe() for backward compatibility
+with run_pipeline.py.
 """
 
 import os
 import json
+import time
 import pandas as pd
 from anthropic import Anthropic
 from dotenv import load_dotenv
-import time
 
 load_dotenv()
 
 ANTHROPIC_API_KEY = os.getenv('ANTHROPIC_API_KEY')
+MODEL = 'claude-haiku-4-5-20251001'
+PROMPT_VERSION = 'v1'
 
-# Stress themes
 STRESS_THEMES = [
-    'credit_risk',
-    'inflation_risk',
-    'liquidity_risk',
-    'geopolitical_risk',
-    'banking_risk',
-    'none'
+    'monetary_policy_risk',
+    'credit_debt_risk',
+    'banking_liquidity_risk',
+    'inflation_growth_risk',
+    'geopolitical_external_risk',
+    'none',
 ]
 
-# Stress directions
-STRESS_DIRECTIONS = [
-    'increasing',
-    'decreasing',
-    'neutral'
+STRESS_DIRECTIONS = ['increasing', 'decreasing', 'neutral']
+
+
+def _client():
+    if not ANTHROPIC_API_KEY:
+        raise ValueError('ANTHROPIC_API_KEY not set')
+    return Anthropic(api_key=ANTHROPIC_API_KEY)
+
+
+def _strip_fences(text):
+    """Strip markdown code fences from LLM JSON response."""
+    text = text.strip()
+    if text.startswith('```'):
+        lines = text.split('\n')
+        lines = lines[1:]
+        if lines and lines[-1].strip() == '```':
+            lines = lines[:-1]
+        text = '\n'.join(lines).strip()
+    return text
+
+
+# ---------------------------------------------------------------------------
+# Task 1: Relevance filter
+# ---------------------------------------------------------------------------
+
+def _relevance_prompt(items):
+    """
+    items: list of {'headline': ..., 'abstract': ...}
+    Returns prompt asking for yes/no per article.
+    """
+    numbered = '\n'.join(
+        f'{i+1}. {it["headline"]}. {it["abstract"]}'
+        for i, it in enumerate(items)
+    )
+    return f"""For each article below, answer: is this article relevant to macroeconomic conditions or financial markets?
+Answer only "yes" or "no" for each article.
+
+{numbered}
+
+Return a JSON array of strings, one per article, in order. Example: ["yes","no","yes"]
+Respond ONLY with valid JSON."""
+
+
+def filter_relevance(articles, batch_size=30):
+    """
+    articles: list of dicts with 'article_id', 'headline', 'abstract'
+    Returns dict mapping article_id -> 'yes' | 'no'
+    """
+    client = _client()
+    results = {}
+
+    for i in range(0, len(articles), batch_size):
+        batch = articles[i:i + batch_size]
+        print(f'  Relevance filter {i+1}-{min(i+batch_size, len(articles))}/{len(articles)}')
+        prompt = _relevance_prompt(batch)
+
+        try:
+            resp = client.messages.create(
+                model=MODEL,
+                max_tokens=1024,
+                messages=[{'role': 'user', 'content': prompt}],
+            )
+            raw = _strip_fences(resp.content[0].text)
+            answers = json.loads(raw)
+            if not isinstance(answers, list):
+                raise ValueError('not a list')
+            # Pad / truncate to batch size
+            while len(answers) < len(batch):
+                answers.append('yes')
+            answers = answers[:len(batch)]
+        except Exception as e:
+            print(f'    relevance filter error: {e} — defaulting to yes')
+            answers = ['yes'] * len(batch)
+
+        for art, ans in zip(batch, answers):
+            results[art['article_id']] = 'yes' if str(ans).lower().startswith('y') else 'no'
+
+        time.sleep(1)
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Task 2: Stress classification
+# ---------------------------------------------------------------------------
+
+def _classify_prompt(items):
+    """
+    items: list of {'headline': ..., 'abstract': ...}
+    Returns classification prompt.
+    """
+    numbered = '\n'.join(
+        f'{i+1}. {it["headline"]}. {it["abstract"]}'
+        for i, it in enumerate(items)
+    )
+    return f"""You are a financial stress analyst. Classify each article across three dimensions.
+
+STRESS THEMES (pick the single most dominant):
+- monetary_policy_risk: Fed decisions, interest rate changes, Fed language shifts, QT/QE
+- credit_debt_risk: credit tightening, debt concerns, yield spread widening, debt ceiling
+- banking_liquidity_risk: bank failures, banking sector instability, liquidity crunches
+- inflation_growth_risk: inflation readings, recession fears, GDP, unemployment, stagflation
+- geopolitical_external_risk: wars, sanctions, energy supply disruptions, trade conflicts
+- none: not related to financial stress
+
+STRESS DIRECTION:
+- increasing: stress rising / conditions worsening
+- decreasing: stress falling / conditions improving
+- neutral: informational, no clear directional signal
+
+MAGNITUDE (how significant is this event):
+- 1: routine coverage, normal market update
+- 2: notable development, worth monitoring
+- 3: major event or crisis-level signal
+
+IMPORTANT: Fed language shifts, emergency policy actions, bank failures, and recession
+confirmations should ALWAYS be scored magnitude 3, regardless of how routine the writing sounds.
+
+Articles:
+{numbered}
+
+Return a JSON array, one object per article, in order:
+[
+  {{"theme": "monetary_policy_risk", "direction": "increasing", "magnitude": 2}},
+  ...
 ]
+Respond ONLY with valid JSON."""
 
 
-def create_classification_prompt(headlines):
+def classify_articles(articles, batch_size=20):
     """
-    Create a structured prompt for headline classification.
-
-    Args:
-        headlines: List of headline strings
-
-    Returns:
-        Formatted prompt string
+    articles: list of dicts with 'article_id', 'headline', 'abstract'
+    Returns dict mapping article_id -> {theme, direction, magnitude}
     """
+    client = _client()
+    results = {}
+
+    for i in range(0, len(articles), batch_size):
+        batch = articles[i:i + batch_size]
+        print(f'  Classifying {i+1}-{min(i+batch_size, len(articles))}/{len(articles)}')
+        prompt = _classify_prompt(batch)
+
+        try:
+            resp = client.messages.create(
+                model=MODEL,
+                max_tokens=4096,
+                messages=[{'role': 'user', 'content': prompt}],
+            )
+            raw = _strip_fences(resp.content[0].text)
+            classifications = json.loads(raw)
+            if not isinstance(classifications, list):
+                raise ValueError('not a list')
+            while len(classifications) < len(batch):
+                classifications.append({'theme': 'none', 'direction': 'neutral', 'magnitude': 1})
+            classifications = classifications[:len(batch)]
+        except Exception as e:
+            print(f'    classification error: {e} — using defaults')
+            classifications = [{'theme': 'none', 'direction': 'neutral', 'magnitude': 1}] * len(batch)
+
+        for art, cls in zip(batch, classifications):
+            results[art['article_id']] = {
+                'theme': cls.get('theme', 'none'),
+                'direction': cls.get('direction', 'neutral'),
+                'magnitude': int(cls.get('magnitude', 1)),
+            }
+
+        time.sleep(1)
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Legacy interface (used by run_pipeline.py)
+# ---------------------------------------------------------------------------
+
+def _legacy_prompt(headlines):
     headlines_json = json.dumps(headlines, indent=2)
+    return f"""You are a financial analyst classifying news headlines for financial stress monitoring.
 
-    prompt = f"""You are a financial analyst tasked with classifying news headlines for financial stress monitoring.
+For each headline, determine:
+1. stress_theme: credit_risk | inflation_risk | liquidity_risk | geopolitical_risk | banking_risk | none
+2. direction: increasing | decreasing | neutral
 
-For each headline below, determine:
-1. The primary stress theme (if any)
-2. The stress direction (whether it suggests stress is increasing, decreasing, or neutral)
+Return a JSON array with one object per headline in the same order.
 
-**Stress Themes:**
-- credit_risk: Issues related to creditworthiness, defaults, debt problems
-- inflation_risk: Inflation concerns, price increases, monetary policy tightening
-- liquidity_risk: Cash flow problems, market liquidity issues, funding stress
-- geopolitical_risk: International conflicts, trade tensions, political instability
-- banking_risk: Banking sector problems, bank failures, financial institution stress
-- none: Not related to financial stress
-
-**Stress Directions:**
-- increasing: Headline suggests stress is rising or worsening
-- decreasing: Headline suggests stress is declining or improving
-- neutral: Headline is informational without clear directional signal
-
-Return your analysis as a JSON array with one object per headline, in the same order as the input.
-
-**Headlines to classify:**
+Headlines:
 {headlines_json}
 
-Respond ONLY with valid JSON in this exact format:
+Respond ONLY with valid JSON:
 [
   {{"theme": "inflation_risk", "direction": "increasing"}},
-  {{"theme": "banking_risk", "direction": "decreasing"}},
   ...
 ]"""
 
-    return prompt
 
+def classify_headlines_batch(headlines, batch_size=20, model=MODEL):
+    client = _client()
+    all_cls = []
 
-def classify_headlines_batch(headlines, batch_size=20, model="claude-haiku-4-5-20251001"):
-    """
-    Classify headlines using Claude API in batches.
-
-    Args:
-        headlines: List of headline strings
-        batch_size: Number of headlines per API call
-        model: Claude model to use
-
-    Returns:
-        List of dicts with 'theme' and 'direction' keys
-    """
-    if not ANTHROPIC_API_KEY:
-        raise ValueError("ANTHROPIC_API_KEY not found in environment variables")
-
-    client = Anthropic(api_key=ANTHROPIC_API_KEY)
-
-    all_classifications = []
-
-    # Process in batches
     for i in range(0, len(headlines), batch_size):
         batch = headlines[i:i + batch_size]
-        print(f"Classifying headlines {i + 1} to {min(i + batch_size, len(headlines))}...")
-
-        prompt = create_classification_prompt(batch)
-
+        print(f'Classifying headlines {i+1} to {min(i+batch_size, len(headlines))}...')
         try:
-            response = client.messages.create(
+            resp = client.messages.create(
                 model=model,
                 max_tokens=4096,
-                messages=[
-                    {"role": "user", "content": prompt}
-                ]
+                messages=[{'role': 'user', 'content': _legacy_prompt(batch)}],
             )
-
-            # Extract JSON from response
-            response_text = response.content[0].text.strip()
-
-            # Strip markdown code fences if present
-            if response_text.startswith("```"):
-                lines = response_text.split("\n")
-                # Remove first line (```json or ```) and last line (```)
-                lines = lines[1:]
-                if lines and lines[-1].strip() == "```":
-                    lines = lines[:-1]
-                response_text = "\n".join(lines).strip()
-
-            # Try to parse JSON
-            classifications = json.loads(response_text)
-
-            if not isinstance(classifications, list):
-                raise ValueError("Response is not a JSON array")
-
-            if len(classifications) != len(batch):
-                print(f"Warning: Expected {len(batch)} classifications, got {len(classifications)}")
-                # Pad with defaults or truncate to match batch size
-                while len(classifications) < len(batch):
-                    classifications.append({"theme": "none", "direction": "neutral"})
-                classifications = classifications[:len(batch)]
-
-            all_classifications.extend(classifications)
-
-            # Rate limiting - small delay between batches
+            raw = _strip_fences(resp.content[0].text)
+            cls = json.loads(raw)
+            if not isinstance(cls, list):
+                raise ValueError('not a list')
+            if len(cls) != len(batch):
+                print(f'Warning: Expected {len(batch)} classifications, got {len(cls)}')
+                while len(cls) < len(batch):
+                    cls.append({'theme': 'none', 'direction': 'neutral'})
+                cls = cls[:len(batch)]
+            all_cls.extend(cls)
             time.sleep(1)
-
-        except json.JSONDecodeError as e:
-            print(f"Error parsing JSON response: {e}")
-            print(f"Response text: {response_text[:500]}")
-            # Add None classifications for failed batch
-            all_classifications.extend([{"theme": "none", "direction": "neutral"}] * len(batch))
-
         except Exception as e:
-            print(f"Error calling Claude API: {e}")
-            # Add None classifications for failed batch
-            all_classifications.extend([{"theme": "none", "direction": "neutral"}] * len(batch))
+            print(f'Error: {e}')
+            all_cls.extend([{'theme': 'none', 'direction': 'neutral'}] * len(batch))
 
-    return all_classifications
+    return all_cls
 
 
 def classify_news_dataframe(df, headline_column='headline', batch_size=20):
-    """
-    Classify headlines in a DataFrame and add classification columns.
-
-    Args:
-        df: pandas DataFrame with news data
-        headline_column: Name of column containing headlines
-        batch_size: Batch size for API calls
-
-    Returns:
-        DataFrame with added 'theme' and 'direction' columns
-    """
     if df.empty:
         df['theme'] = []
         df['direction'] = []
         return df
-
     headlines = df[headline_column].tolist()
-
-    print(f"Classifying {len(headlines)} headlines...")
-    classifications = classify_headlines_batch(headlines, batch_size=batch_size)
-
-    # Add classifications to DataFrame
+    print(f'Classifying {len(headlines)} headlines...')
+    cls = classify_headlines_batch(headlines, batch_size=batch_size)
     df = df.copy()
-    df['theme'] = [c.get('theme', 'none') for c in classifications]
-    df['direction'] = [c.get('direction', 'neutral') for c in classifications]
-
-    print(f"Classification complete.")
-    print(f"Theme distribution:")
-    print(df['theme'].value_counts())
-    print(f"\nDirection distribution:")
-    print(df['direction'].value_counts())
-
+    df['theme'] = [c.get('theme', 'none') for c in cls]
+    df['direction'] = [c.get('direction', 'neutral') for c in cls]
+    print('Classification complete.')
     return df
 
 
 def calculate_stress_score(df, date_column='date', direction_column='direction'):
-    """
-    Calculate aggregate stress score by counting directional sentiment.
-
-    Args:
-        df: DataFrame with classified news
-        date_column: Name of date column
-        direction_column: Name of direction column
-
-    Returns:
-        Float between -1 and 1 representing stress sentiment
-        (positive = stress increasing, negative = stress decreasing)
-    """
     if df.empty:
         return 0.0
-
-    direction_counts = df[direction_column].value_counts()
-
-    increasing = direction_counts.get('increasing', 0)
-    decreasing = direction_counts.get('decreasing', 0)
-    total = len(df)
-
-    if total == 0:
-        return 0.0
-
-    # Score: (% increasing - % decreasing)
-    score = (increasing - decreasing) / total
-
-    return score
-
-
-if __name__ == '__main__':
-    # Test with sample headlines
-    test_headlines = [
-        "Federal Reserve raises interest rates to combat inflation",
-        "Banking crisis eases as regulators step in",
-        "Stock market rallies on positive economic data",
-        "Credit default rates surge to decade high",
-        "Central bank provides emergency liquidity to markets",
-        "Inflation shows signs of cooling in latest report",
-        "Geopolitical tensions escalate in Middle East",
-        "Tech stocks lead market gains"
-    ]
-
-    print("Testing classifier with sample headlines...")
-    print("=" * 60)
-
-    # Create test DataFrame
-    test_df = pd.DataFrame({
-        'date': pd.date_range('2024-01-01', periods=len(test_headlines)),
-        'headline': test_headlines,
-        'source': 'Test'
-    })
-
-    # Classify
-    classified_df = classify_news_dataframe(test_df)
-
-    print("\nClassified headlines:")
-    print(classified_df[['headline', 'theme', 'direction']])
-
-    # Calculate stress score
-    score = calculate_stress_score(classified_df)
-    print(f"\nOverall stress score: {score:.3f}")
+    counts = df[direction_column].value_counts()
+    return (counts.get('increasing', 0) - counts.get('decreasing', 0)) / max(len(df), 1)

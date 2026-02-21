@@ -3,6 +3,6 @@ requests>=2.31.0
 streamlit>=1.28.0
 plotly>=5.17.0
 anthropic>=0.18.0
-gdeltdoc>=1.4
 python-dotenv>=1.0.0
 numpy>=1.24.0
+scikit-learn>=1.3.0
