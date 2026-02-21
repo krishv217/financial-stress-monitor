@@ -52,7 +52,7 @@ QUERIES = [
     'stock market OR market volatility OR financial markets', # Q10 equity/broad
 ]
 
-START_DATE = datetime(2025, 8, 1)
+START_DATE = datetime(2003, 1, 3)
 RAW_CSV = 'data/raw_articles.csv'
 FIELDNAMES = [
     'article_id', 'source', 'query_number', 'week_start',
@@ -65,11 +65,11 @@ FIELDNAMES = [
 # ---------------------------------------------------------------------------
 
 def get_target_weeks():
-    """Generate bi-weekly Monday dates from START_DATE through today."""
+    """Generate weekly Monday dates from START_DATE through today."""
     weeks, d, today = [], START_DATE, datetime.now()
     while d <= today:
         weeks.append(d)
-        d += timedelta(weeks=2)
+        d += timedelta(weeks=1)
     return weeks
 
 
@@ -94,14 +94,16 @@ def fetch_page(query, begin_date, end_date, page):
         try:
             r = requests.get(NYT_BASE_URL, params=params, timeout=30)
             if r.status_code == 429:
-                print('      [429] rate limit — waiting 60s...')
+                print('      [429] rate limit — rotating key and waiting 60s...')
+                params['api-key'] = next(_key_cycle)
                 time.sleep(60)
                 continue
             r.raise_for_status()
             data = r.json()
             if 'fault' in data:
                 msg = data['fault'].get('faultstring', 'rate limit')
-                print(f'      [fault] {msg} — waiting 60s...')
+                print(f'      [fault] {msg} — rotating key and waiting 60s...')
+                params['api-key'] = next(_key_cycle)
                 time.sleep(60)
                 continue
             if data.get('status') != 'OK':
@@ -113,9 +115,14 @@ def fetch_page(query, begin_date, end_date, page):
             time.sleep(15)
 
 
+# Q1-Q4, Q9-Q10 are high-volume: 2 pages. Q5-Q8 are low-volume: 1 page.
+QUERY_PAGES = {1: 2, 2: 2, 3: 2, 4: 2, 5: 1, 6: 1, 7: 1, 8: 1, 9: 2, 10: 2}
+
+
 def collect_week(week_start):
     """
-    Collect up to 300 articles for one week (10 queries x 3 pages).
+    Collect articles for one week using per-query page limits.
+    High-volume queries (Q1-Q4, Q9-Q10): 2 pages. Low-volume (Q5-Q8): 1 page.
     Returns deduplicated list of article dicts.
     """
     end = week_start + timedelta(days=6)
@@ -128,8 +135,9 @@ def collect_week(week_start):
     counter = 1
 
     for q_num, query in enumerate(QUERIES, 1):
-        for page in range(3):
-            label = f'Q{q_num} page {page + 1}/3'
+        pages = QUERY_PAGES[q_num]
+        for page in range(pages):
+            label = f'Q{q_num} page {page + 1}/{pages}'
             print(f'    {label} ({begin_str} to {end_str}) ...', end=' ', flush=True)
 
             docs = fetch_page(query, begin_str, end_str, page)
@@ -193,6 +201,7 @@ def main():
     weeks = get_target_weeks()
     collected = load_collected_weeks()
     remaining = [w for w in weeks if w.strftime('%Y-%m-%d') not in collected]
+    remaining = remaining[::-1]  # collect most recent weeks first (backwards to 2019)
 
     if args.test:
         remaining = remaining[:2]
