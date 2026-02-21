@@ -2,7 +2,8 @@
   "permissions": {
     "allow": [
       "Bash(git config:*)",
-      "Read(//private/tmp/**)"
+      "Read(//private/tmp/**)",
+      "Bash(tee:*)"
     ]
   }
 }
