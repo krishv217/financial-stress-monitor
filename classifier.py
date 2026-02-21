@@ -20,7 +20,7 @@ load_dotenv()
 
 ANTHROPIC_API_KEY = os.getenv('ANTHROPIC_API_KEY')
 MODEL = 'claude-haiku-4-5-20251001'
-PROMPT_VERSION = 'v1'
+PROMPT_VERSION = 'v2'
 
 STRESS_THEMES = [
     'monetary_policy_risk',
@@ -120,15 +120,15 @@ def filter_relevance(articles, batch_size=30):
 def _classify_prompt(items):
     """
     items: list of {'headline': ..., 'abstract': ...}
-    Returns classification prompt.
+    Returns classification prompt requesting 1-3 themes per article.
     """
     numbered = '\n'.join(
         f'{i+1}. {it["headline"]}. {it["abstract"]}'
         for i, it in enumerate(items)
     )
-    return f"""You are a financial stress analyst. Classify each article across three dimensions.
+    return f"""You are a financial stress analyst. For each article identify ALL relevant stress themes (1-3 maximum, most relevant first).
 
-STRESS THEMES (pick the single most dominant):
+STRESS THEMES:
 - monetary_policy_risk: Fed decisions, interest rate changes, Fed language shifts, QT/QE
 - credit_debt_risk: credit tightening, debt concerns, yield spread widening, debt ceiling
 - banking_liquidity_risk: bank failures, banking sector instability, liquidity crunches
@@ -136,37 +136,50 @@ STRESS THEMES (pick the single most dominant):
 - geopolitical_external_risk: wars, sanctions, energy supply disruptions, trade conflicts
 - none: not related to financial stress
 
-STRESS DIRECTION:
+STRESS DIRECTION (per theme):
 - increasing: stress rising / conditions worsening
 - decreasing: stress falling / conditions improving
 - neutral: informational, no clear directional signal
 
-MAGNITUDE (how significant is this event):
-- 1: routine coverage, normal market update
-- 2: notable development, worth monitoring
+MAGNITUDE (per theme) — be aggressive, do not default to 1:
+- 1: routine coverage, monthly data in-line with expectations, minor updates
+- 2: notable development, moderate surprise, worth monitoring
 - 3: major event or crisis-level signal
 
-IMPORTANT: Fed language shifts, emergency policy actions, bank failures, and recession
-confirmations should ALWAYS be scored magnitude 3, regardless of how routine the writing sounds.
+ALWAYS score magnitude 3 for:
+- Any Fed rate decision, pivot, or significant forward guidance shift
+- Any bank failure, emergency liquidity action, or FDIC intervention
+- Recession confirmation, GDP contraction, or large unemployment spike
+- Major trade war escalation, large tariff announcement, or broad sanctions package
+- Debt ceiling breach risk, sovereign credit downgrade, or debt crisis signal
+- Market crash, circuit breaker, or systemic risk event
 
 Articles:
 {numbered}
 
-Return a JSON array, one object per article, in order:
+Return a JSON array with one entry per article. Each entry is an array of 1-3 classification objects ordered by relevance:
 [
-  {{"theme": "monetary_policy_risk", "direction": "increasing", "magnitude": 2}},
+  [
+    {{"theme": "monetary_policy_risk", "direction": "increasing", "magnitude": 3}},
+    {{"theme": "banking_liquidity_risk", "direction": "increasing", "magnitude": 2}}
+  ],
+  [
+    {{"theme": "inflation_growth_risk", "direction": "decreasing", "magnitude": 1}}
+  ],
   ...
 ]
 Respond ONLY with valid JSON."""
 
 
-def classify_articles(articles, batch_size=20):
+def classify_articles(articles, batch_size=10):
     """
     articles: list of dicts with 'article_id', 'headline', 'abstract'
-    Returns dict mapping article_id -> {theme, direction, magnitude}
+    Returns dict mapping article_id -> list of {theme, direction, magnitude} dicts (1-3 per article)
     """
     client = _client()
     results = {}
+
+    _default = [{'theme': 'none', 'direction': 'neutral', 'magnitude': 1}]
 
     for i in range(0, len(articles), batch_size):
         batch = articles[i:i + batch_size]
@@ -184,18 +197,30 @@ def classify_articles(articles, batch_size=20):
             if not isinstance(classifications, list):
                 raise ValueError('not a list')
             while len(classifications) < len(batch):
-                classifications.append({'theme': 'none', 'direction': 'neutral', 'magnitude': 1})
+                classifications.append(_default)
             classifications = classifications[:len(batch)]
         except Exception as e:
             print(f'    classification error: {e} — using defaults')
-            classifications = [{'theme': 'none', 'direction': 'neutral', 'magnitude': 1}] * len(batch)
+            classifications = [_default] * len(batch)
 
-        for art, cls in zip(batch, classifications):
-            results[art['article_id']] = {
-                'theme': cls.get('theme', 'none'),
-                'direction': cls.get('direction', 'neutral'),
-                'magnitude': int(cls.get('magnitude', 1)),
-            }
+        for art, cls_list in zip(batch, classifications):
+            # Ensure it's a list; single-dict responses are wrapped
+            if isinstance(cls_list, dict):
+                cls_list = [cls_list]
+            cleaned = []
+            for cls in cls_list[:3]:
+                theme = cls.get('theme', 'none')
+                direction = cls.get('direction', 'neutral')
+                try:
+                    magnitude = max(1, min(3, int(cls.get('magnitude', 1))))
+                except (ValueError, TypeError):
+                    magnitude = 1
+                if theme not in STRESS_THEMES:
+                    theme = 'none'
+                if direction not in STRESS_DIRECTIONS:
+                    direction = 'neutral'
+                cleaned.append({'theme': theme, 'direction': direction, 'magnitude': magnitude})
+            results[art['article_id']] = cleaned if cleaned else _default
 
         time.sleep(1)
 
