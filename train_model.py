@@ -1,7 +1,7 @@
 """
 ML Model Training — Phase 6
 
-Trains Linear Regression AND Random Forest across 5 prediction horizons:
+Trains LinearRegression, LassoCV, RandomForest, XGBoost, LightGBM across 5 prediction horizons:
   1w, 2w, 4w, 8w, 12w future FRED stress index
 
 Features : 5 theme sentiment scores + current fred_score
@@ -30,6 +30,8 @@ from datetime import datetime
 from sklearn.linear_model import LinearRegression, LassoCV
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import mean_squared_error, r2_score
+from xgboost import XGBRegressor
+from lightgbm import LGBMRegressor
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -61,6 +63,16 @@ MODELS = [
     ('LinearRegression', lambda: LinearRegression()),
     ('LassoCV',          lambda: LassoCV(cv=5, max_iter=5000)),
     ('RandomForest',     lambda: RandomForestRegressor(n_estimators=100, random_state=42)),
+    ('XGBoost',          lambda: XGBRegressor(
+                             n_estimators=200, learning_rate=0.05, max_depth=3,
+                             subsample=0.8, colsample_bytree=0.8,
+                             reg_alpha=0.1, reg_lambda=1.0,
+                             random_state=42, verbosity=0)),
+    ('LightGBM',         lambda: LGBMRegressor(
+                             n_estimators=200, learning_rate=0.05, max_depth=3,
+                             subsample=0.8, colsample_bytree=0.8,
+                             reg_alpha=0.1, reg_lambda=1.0,
+                             random_state=42, verbose=-1)),
 ]
 
 TRAIN_SPLIT = 0.9   # fraction of labeled data used for training
@@ -139,7 +151,7 @@ def _train_one(df, target_col, model_instance):
     train_df = labeled.iloc[:n_train]
     test_df  = labeled.iloc[n_train:]
 
-    X_train = train_df[FEATURE_COLS].values
+    X_train = train_df[FEATURE_COLS]   # keep DataFrame so feature names propagate
     y_train = train_df[delta_col].values
 
     model_instance.fit(X_train, y_train)
@@ -152,7 +164,7 @@ def _train_one(df, target_col, model_instance):
     }
 
     if not test_df.empty:
-        X_test = test_df[FEATURE_COLS].values
+        X_test = test_df[FEATURE_COLS]  # keep DataFrame
         y_test = test_df[delta_col].values
         y_pred = model_instance.predict(X_test)
         metrics['test_r2']   = r2_score(y_test, y_pred)
@@ -254,7 +266,7 @@ def predict_current_weeks(df, model, model_version, horizon_label='2w',
         week_str = row['week_start'].strftime('%Y-%m-%d')
         if (week_str, horizon_label) in existing_keys:
             continue
-        X = np.array([[row[c] for c in FEATURE_COLS]])
+        X = pd.DataFrame([[row[c] for c in FEATURE_COLS]], columns=FEATURE_COLS)
         pred_delta = float(model.predict(X)[0])
         # Model predicts Δfred; convert to absolute FRED for storage
         pred_abs = round(float(row['fred_score']) + pred_delta, 4)
