@@ -151,8 +151,11 @@ def run_phase2(prompt_ver=PROMPT_VERSION):
 # Phase 3: LLM classification
 # ---------------------------------------------------------------------------
 
-def run_phase3(prompt_ver=PROMPT_VERSION):
-    """Classify relevant articles that don't yet have a stress_theme."""
+def run_phase3(prompt_ver=PROMPT_VERSION, date_from=None, date_to=None):
+    """Classify relevant articles that don't yet have a stress_theme.
+
+    date_from / date_to: optional 'YYYY-MM-DD' strings to restrict by week_start.
+    """
     print('\n=== Phase 3: LLM Classification ===')
 
     if not os.path.exists(CLASSIFIED_CSV) or os.path.getsize(CLASSIFIED_CSV) == 0:
@@ -166,11 +169,19 @@ def run_phase3(prompt_ver=PROMPT_VERSION):
         df['stress_themes'] = ''
 
     # Articles that are relevant but not yet classified (or need reclassification)
-    to_classify = df[
+    mask = (
         (df['is_relevant'] == 'yes') &
         ((df['stress_theme'] == '') | (df['prompt_version'] != prompt_ver))
-    ]
+    )
+    if date_from:
+        mask &= df['week_start'] >= date_from
+    if date_to:
+        mask &= df['week_start'] <= date_to
+    to_classify = df[mask]
 
+    if date_from or date_to:
+        range_str = f'{date_from or "start"} to {date_to or "end"}'
+        print(f'Date range     : {range_str}')
     print(f'Articles needing classification: {len(to_classify)}')
     if to_classify.empty:
         print('Nothing to classify.')
@@ -332,13 +343,17 @@ def main():
                         help='Run a specific phase only (default: all)')
     parser.add_argument('--prompt-version', default=PROMPT_VERSION,
                         help='Prompt version label (default: v1)')
+    parser.add_argument('--date-from', default=None,
+                        help='Phase 3 only: restrict to week_start >= YYYY-MM-DD')
+    parser.add_argument('--date-to', default=None,
+                        help='Phase 3 only: restrict to week_start <= YYYY-MM-DD')
     args = parser.parse_args()
     pv = args.prompt_version
 
     if args.phase == 2:
         run_phase2(pv)
     elif args.phase == 3:
-        run_phase3(pv)
+        run_phase3(pv, date_from=args.date_from, date_to=args.date_to)
     elif args.phase == 4:
         run_phase4(pv)
     else:

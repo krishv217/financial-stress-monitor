@@ -19,8 +19,10 @@ from dotenv import load_dotenv
 load_dotenv()
 
 ANTHROPIC_API_KEY = os.getenv('ANTHROPIC_API_KEY')
-MODEL = 'claude-haiku-4-5-20251001'
-PROMPT_VERSION = 'v2'
+RELEVANCE_MODEL    = 'claude-haiku-4-5-20251001'   # fast yes/no filter
+CLASSIFY_MODEL     = 'claude-sonnet-4-6'            # nuanced multi-theme classification
+MODEL              = CLASSIFY_MODEL                 # legacy alias
+PROMPT_VERSION     = 'v3'
 
 STRESS_THEMES = [
     'monetary_policy_risk',
@@ -89,7 +91,7 @@ def filter_relevance(articles, batch_size=30):
 
         try:
             resp = client.messages.create(
-                model=MODEL,
+                model=RELEVANCE_MODEL,
                 max_tokens=1024,
                 messages=[{'role': 'user', 'content': prompt}],
             )
@@ -126,33 +128,41 @@ def _classify_prompt(items):
         f'{i+1}. {it["headline"]}. {it["abstract"]}'
         for i, it in enumerate(items)
     )
-    return f"""You are a financial stress analyst. For each article identify ALL relevant stress themes (1-3 maximum, most relevant first).
+    return f"""You are a financial stress analyst calibrated to predict the St. Louis Fed Financial Stress Index (STLFSI4). For each article identify ALL relevant stress themes (1-3 maximum, most relevant first).
+
+CRITICAL RULE — DIRECTION MUST REFLECT REALIZED US FINANCIAL STRESS, NOT NARRATIVE ANXIETY:
+Score "increasing" ONLY if the event has a direct, near-term transmission mechanism into US financial system stress metrics (credit spreads, bank funding costs, interbank rates, systemic risk indicators). News coverage of a risk event alone is NOT sufficient — the event must plausibly move those metrics.
 
 STRESS THEMES:
 - monetary_policy_risk: Fed decisions, interest rate changes, Fed language shifts, QT/QE
-- credit_debt_risk: credit tightening, debt concerns, yield spread widening, debt ceiling
-- banking_liquidity_risk: bank failures, banking sector instability, liquidity crunches
-- inflation_growth_risk: inflation readings, recession fears, GDP, unemployment, stagflation
-- geopolitical_external_risk: wars, sanctions, energy supply disruptions, trade conflicts
+- credit_debt_risk: credit tightening, yield spread widening, debt ceiling breach risk, corporate/sovereign default risk
+- banking_liquidity_risk: bank failures, FDIC intervention, deposit flight, interbank funding stress
+- inflation_growth_risk: CPI/PCE surprises, GDP contraction, recession confirmation, large unemployment spike
+- geopolitical_external_risk: ONLY if there is a direct financial transmission channel (e.g. energy supply shock raising credit costs, sanctions freezing dollar liquidity, trade war measurably tightening US credit conditions). General war coverage, tariff announcements, or sanctions news WITHOUT a clear financial market impact = score as "neutral", not "increasing"
 - none: not related to financial stress
 
 STRESS DIRECTION (per theme):
-- increasing: stress rising / conditions worsening
+- increasing: stress rising with a clear transmission to US financial system metrics
 - decreasing: stress falling / conditions improving
-- neutral: informational, no clear directional signal
+- neutral: informational, potential risk discussed but no confirmed financial market impact yet
 
 MAGNITUDE (per theme) — be aggressive, do not default to 1:
-- 1: routine coverage, monthly data in-line with expectations, minor updates
-- 2: notable development, moderate surprise, worth monitoring
-- 3: major event or crisis-level signal
+- 1: routine coverage, data in-line with expectations, minor developments
+- 2: notable surprise, moderate market reaction, worth monitoring
+- 3: major confirmed event with immediate financial system impact
 
 ALWAYS score magnitude 3 for:
 - Any Fed rate decision, pivot, or significant forward guidance shift
 - Any bank failure, emergency liquidity action, or FDIC intervention
 - Recession confirmation, GDP contraction, or large unemployment spike
-- Major trade war escalation, large tariff announcement, or broad sanctions package
 - Debt ceiling breach risk, sovereign credit downgrade, or debt crisis signal
 - Market crash, circuit breaker, or systemic risk event
+- Sanctions or trade actions that have already caused measurable credit spread widening or dollar funding stress
+
+DO NOT score magnitude 3 for:
+- Tariff announcements or geopolitical events where financial market impact is speculative
+- Routine Fed speeches reiterating existing policy
+- War/conflict coverage without confirmed financial transmission
 
 Articles:
 {numbered}
@@ -188,7 +198,7 @@ def classify_articles(articles, batch_size=10):
 
         try:
             resp = client.messages.create(
-                model=MODEL,
+                model=CLASSIFY_MODEL,
                 max_tokens=4096,
                 messages=[{'role': 'user', 'content': prompt}],
             )
