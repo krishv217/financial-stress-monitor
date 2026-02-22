@@ -1,2 +1,2 @@
-week_start,predicted_fred_score,actual_fred_score,prediction_error,model_version
-2026-02-13,-0.5399,,,v1
+week_start,horizon,model_name,predicted_fred_score,actual_fred_score,prediction_error,model_version
+2026-02-13,2w,LassoCV,-0.4664,,,v2
