@@ -26,13 +26,17 @@ WEEKLY_CSV      = 'data/weekly_sentiment_scores.csv'
 PREDICTIONS_CSV = 'data/model_predictions.csv'
 CLASSIFIED_CSV  = 'data/classified_articles.csv'
 
-FEATURE_COLS = [
+SENTIMENT_COLS = [
     'monetary_policy_score', 'credit_debt_score', 'banking_liquidity_score',
-    'inflation_growth_score', 'geopolitical_external_score', 'fred_score',
+    'inflation_growth_score', 'geopolitical_external_score',
 ]
+LAG_COLS = [f'lag1_{c}' for c in SENTIMENT_COLS]
+FEATURE_COLS = SENTIMENT_COLS + ['fred_score'] + LAG_COLS
 FEATURE_LABELS = [
     'Monetary Policy', 'Credit & Debt', 'Banking & Liquidity',
     'Inflation & Growth', 'Geopolitical', 'Current FRED',
+    'Lag: Monetary Policy', 'Lag: Credit & Debt', 'Lag: Banking & Liquidity',
+    'Lag: Inflation & Growth', 'Lag: Geopolitical',
 ]
 
 THEME_COLS = {
@@ -57,7 +61,7 @@ MODEL_DEFS = [
     ('RandomForest',     lambda: RandomForestRegressor(n_estimators=100, random_state=42), '#ef4444'),
 ]
 
-TRAIN_SPLIT = 0.8
+TRAIN_SPLIT = 0.9
 
 st.set_page_config(page_title='Financial Stress Monitor', page_icon='📊', layout='wide')
 
@@ -72,11 +76,14 @@ def load_weekly():
         return pd.DataFrame()
     df = pd.read_csv(WEEKLY_CSV)
     df['week_start'] = pd.to_datetime(df['week_start'])
-    all_num = FEATURE_COLS + [h[1] for h in HORIZONS] + ['total_articles']
+    all_num = SENTIMENT_COLS + ['fred_score'] + [h[1] for h in HORIZONS] + ['total_articles']
     for col in all_num:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors='coerce')
-    return df.sort_values('week_start').reset_index(drop=True)
+    df = df.sort_values('week_start').reset_index(drop=True)
+    for col in SENTIMENT_COLS:
+        df[f'lag1_{col}'] = df[col].shift(1)
+    return df
 
 
 @st.cache_data(ttl=300)
@@ -119,15 +126,18 @@ def train_all_models():
     for h_label, h_col, _ in HORIZONS:
         if h_col not in weekly.columns:
             continue
-        labeled = weekly.dropna(subset=FEATURE_COLS + [h_col]).copy()
+        delta_col = h_col + '_delta'
+        work = weekly.copy()
+        work[delta_col] = work[h_col] - work['fred_score']
+        labeled = work.dropna(subset=FEATURE_COLS + [delta_col]).copy()
         if len(labeled) < 10:
             continue
         n_train = max(5, int(len(labeled) * TRAIN_SPLIT))
         train_df = labeled.iloc[:n_train]
         test_df  = labeled.iloc[n_train:]
 
-        X_train, y_train = train_df[FEATURE_COLS].values, train_df[h_col].values
-        X_test,  y_test  = test_df[FEATURE_COLS].values,  test_df[h_col].values
+        X_train, y_train = train_df[FEATURE_COLS].values, train_df[delta_col].values
+        X_test,  y_test  = test_df[FEATURE_COLS].values,  test_df[delta_col].values
 
         for m_name, m_factory, _ in MODEL_DEFS:
             model = m_factory()
@@ -371,7 +381,10 @@ def _feature_importance_chart(model_results, h_label):
 
 
 def _horizon_scatter(weekly, model_results, h_label, h_col, h_name):
-    labeled = weekly.dropna(subset=FEATURE_COLS + [h_col])
+    delta_col = h_col + '_delta'
+    work = weekly.copy()
+    work[delta_col] = work[h_col] - work['fred_score']
+    labeled = work.dropna(subset=FEATURE_COLS + [delta_col])
     if labeled.empty:
         st.info(f'No labeled data for {h_name}.')
         return
@@ -409,14 +422,18 @@ def _horizon_scatter(weekly, model_results, h_label, h_col, h_name):
         bgcolor='rgba(255,255,255,0.7)',
     )
 
-    # Actual FRED
+    # Actual Δfred
+    actual_delta = labeled[delta_col].values
     fig.add_trace(go.Scatter(
-        x=labeled['week_start'], y=labeled[h_col],
-        mode='lines+markers', name='Actual FRED',
+        x=labeled['week_start'], y=actual_delta,
+        mode='lines+markers', name='Actual ΔFRED',
         line=dict(color='#1e293b', width=2.5),
         marker=dict(size=5),
-        hovertemplate='%{x|%Y-%m-%d}<br>Actual: %{y:.4f}<extra></extra>',
+        hovertemplate='%{x|%Y-%m-%d}<br>Actual Δ: %{y:.4f}<extra></extra>',
     ))
+
+    # Zero line for reference
+    fig.add_hline(y=0, line_color='gray', line_dash='dash', line_width=1)
 
     for m_name, _, color in MODEL_DEFS:
         key = (h_label, m_name)
@@ -425,13 +442,13 @@ def _horizon_scatter(weekly, model_results, h_label, h_col, h_name):
         res = model_results[key]
         short = m_name.replace('LinearRegression', 'Linear').replace('RandomForest', 'RF')
 
-        # Train predictions (faded)
+        # Train predictions (faded) — already in delta space
         fig.add_trace(go.Scatter(
             x=res['train_weeks'], y=res['train_preds'],
             mode='lines', name=f'{short} (train)',
             line=dict(color=color, width=1.5, dash='dot'),
             opacity=0.6, showlegend=False,
-            hovertemplate=f'{short} train: %{{y:.4f}}<extra></extra>',
+            hovertemplate=f'{short} train Δ: %{{y:.4f}}<extra></extra>',
         ))
         # Test predictions (bold dashed)
         if res['test_preds']:
@@ -441,12 +458,12 @@ def _horizon_scatter(weekly, model_results, h_label, h_col, h_name):
                 mode='lines+markers', name=f'{short}  (test R²={r2_str})',
                 line=dict(color=color, width=2, dash='dash'),
                 marker=dict(size=7, symbol='diamond'),
-                hovertemplate=f'%{{x|%Y-%m-%d}}<br>{short}: %{{y:.4f}}<extra></extra>',
+                hovertemplate=f'%{{x|%Y-%m-%d}}<br>{short} Δ: %{{y:.4f}}<extra></extra>',
             ))
 
     fig.update_layout(
-        title=f'Predicted vs Actual FRED — {h_name}',
-        xaxis_title='Week', yaxis_title='FRED Score',
+        title=f'Predicted vs Actual ΔFRED — {h_name}',
+        xaxis_title='Week', yaxis_title='ΔFRED (change from current)',
         height=480,
         hovermode='x unified',
         legend=dict(orientation='h', y=1.08, font_size=11),

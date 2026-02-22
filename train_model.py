@@ -5,7 +5,9 @@ Trains Linear Regression AND Random Forest across 5 prediction horizons:
   1w, 2w, 4w, 8w, 12w future FRED stress index
 
 Features : 5 theme sentiment scores + current fred_score
-Target   : fred_score_{horizon}_future
+           + 5 lagged (previous week) sentiment scores
+Target   : Δfred = fred_score_{horizon}_future - fred_score  (change, not level)
+           Predictions are converted back to absolute FRED for storage.
 
 Prints a comparison table of Test R², RMSE, MAE for every model+horizon.
 Saves the best model per horizon to data/model_{horizon}.pkl
@@ -35,14 +37,17 @@ load_dotenv()
 WEEKLY_CSV = 'data/weekly_sentiment_scores.csv'
 PREDICTIONS_CSV = 'data/model_predictions.csv'
 
-FEATURE_COLS = [
+SENTIMENT_COLS = [
     'monetary_policy_score',
     'credit_debt_score',
     'banking_liquidity_score',
     'inflation_growth_score',
     'geopolitical_external_score',
-    'fred_score',
 ]
+
+LAG_COLS = [f'lag1_{c}' for c in SENTIMENT_COLS]
+
+FEATURE_COLS = SENTIMENT_COLS + ['fred_score'] + LAG_COLS
 
 HORIZONS = [
     ('1w',  'fred_score_1w_future'),
@@ -58,7 +63,7 @@ MODELS = [
     ('RandomForest',     lambda: RandomForestRegressor(n_estimators=100, random_state=42)),
 ]
 
-TRAIN_SPLIT = 0.8   # fraction of labeled data used for training
+TRAIN_SPLIT = 0.9   # fraction of labeled data used for training
 
 
 # ---------------------------------------------------------------------------
@@ -70,11 +75,15 @@ def load_weekly():
         return pd.DataFrame()
     df = pd.read_csv(WEEKLY_CSV)
     df['week_start'] = pd.to_datetime(df['week_start'])
-    all_numeric = FEATURE_COLS + [col for _, col in HORIZONS]
+    all_numeric = SENTIMENT_COLS + ['fred_score'] + [col for _, col in HORIZONS]
     for col in all_numeric:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors='coerce')
-    return df.sort_values('week_start').reset_index(drop=True)
+    df = df.sort_values('week_start').reset_index(drop=True)
+    # Add lagged sentiment features (previous week's scores)
+    for col in SENTIMENT_COLS:
+        df[f'lag1_{col}'] = df[col].shift(1)
+    return df
 
 
 def model_pkl_path(horizon_label, model_name):
@@ -115,9 +124,14 @@ def next_model_version():
 def _train_one(df, target_col, model_instance):
     """
     Train a single model for one horizon.
+    Target is Δfred = fred_score_{horizon}_future - fred_score (change, not level).
     Returns (fitted_model, metrics_dict) or (None, {}) if not enough data.
     """
-    labeled = df.dropna(subset=FEATURE_COLS + [target_col])
+    work = df.copy()
+    delta_col = target_col + '_delta'
+    work[delta_col] = work[target_col] - work['fred_score']
+
+    labeled = work.dropna(subset=FEATURE_COLS + [delta_col])
     if len(labeled) < 10:
         return None, {'error': f'only {len(labeled)} labeled rows'}
 
@@ -126,7 +140,7 @@ def _train_one(df, target_col, model_instance):
     test_df  = labeled.iloc[n_train:]
 
     X_train = train_df[FEATURE_COLS].values
-    y_train = train_df[target_col].values
+    y_train = train_df[delta_col].values
 
     model_instance.fit(X_train, y_train)
 
@@ -139,7 +153,7 @@ def _train_one(df, target_col, model_instance):
 
     if not test_df.empty:
         X_test = test_df[FEATURE_COLS].values
-        y_test = test_df[target_col].values
+        y_test = test_df[delta_col].values
         y_pred = model_instance.predict(X_test)
         metrics['test_r2']   = r2_score(y_test, y_pred)
         metrics['test_rmse'] = float(np.sqrt(mean_squared_error(y_test, y_pred)))
@@ -241,12 +255,14 @@ def predict_current_weeks(df, model, model_version, horizon_label='2w',
         if (week_str, horizon_label) in existing_keys:
             continue
         X = np.array([[row[c] for c in FEATURE_COLS]])
-        pred = float(model.predict(X)[0])
+        pred_delta = float(model.predict(X)[0])
+        # Model predicts Δfred; convert to absolute FRED for storage
+        pred_abs = round(float(row['fred_score']) + pred_delta, 4)
         new_rows.append({
             'week_start': week_str,
             'horizon': horizon_label,
             'model_name': type(model).__name__,
-            'predicted_fred_score': round(pred, 4),
+            'predicted_fred_score': pred_abs,
             'actual_fred_score': '',
             'prediction_error': '',
             'model_version': model_version,

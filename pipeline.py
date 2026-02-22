@@ -294,9 +294,16 @@ def run_phase4(prompt_ver=PROMPT_VERSION):
 
     fred_series = _get_fred_series()
 
-    # Group by week_start
+    # Snap all week_start dates to Friday (FRED publishes on Fridays;
+    # Kaggle data uses Monday week_start, API data uses Friday — normalise to Friday)
+    relevant = relevant.copy()
+    relevant['week_friday'] = pd.to_datetime(relevant['week_start']).apply(
+        lambda d: (d + timedelta(days=(4 - d.weekday()) % 7)).strftime('%Y-%m-%d')
+    )
+
+    # Group by Friday-snapped date
     weekly_rows = []
-    for week_start, group in relevant.groupby('week_start'):
+    for week_start, group in relevant.groupby('week_friday'):
         row = {
             'week_start': week_start,
             'fred_score': _nearest_fred(fred_series, week_start),
