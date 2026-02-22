@@ -271,7 +271,7 @@ def panel_fred_trend(weekly):
             ))
         break  # actuals identical across models
 
-    # Dotted connector + forecast star — Linear only on front page
+    # Dotted connector + CI cone + forecast star — Linear only on front page
     for m_name, _, color in [m for m in MODEL_DEFS if m[0] == 'LinearRegression']:
         key = ('1w', m_name, 'abs')
         if key not in model_results:
@@ -285,7 +285,27 @@ def panel_fred_trend(weekly):
             continue
         ft, fp = future[-1]
         short = m_name.replace('LinearRegression', 'Linear').replace('RandomForest', 'RF')
-        # Dotted line from last actual point to forecast star
+
+        # 95% CI from test set residuals
+        ci_half = None
+        if res['test_preds'] and res['test_actuals']:
+            residuals = np.array(res['test_actuals']) - np.array(res['test_preds'])
+            ci_half = 1.96 * float(np.std(residuals))
+
+        # Shaded cone: narrows to actual point on left, opens to CI range on right
+        if ci_half is not None:
+            fig.add_trace(go.Scatter(
+                x=[last_actual_x, ft, ft, last_actual_x],
+                y=[last_actual_y, fp + ci_half, fp - ci_half, last_actual_y],
+                fill='toself',
+                fillcolor='rgba(245,158,11,0.12)',
+                line=dict(width=0),
+                showlegend=True,
+                name=f'95% CI (±{ci_half:.4f})',
+                hoverinfo='skip',
+            ))
+
+        # Dotted centre line
         fig.add_trace(go.Scatter(
             x=[last_actual_x, ft], y=[last_actual_y, fp],
             mode='lines', showlegend=False,
@@ -298,7 +318,7 @@ def panel_fred_trend(weekly):
             mode='markers', name=f'{short} forecast ({ft.strftime("%Y-%m-%d")})',
             marker=dict(size=14, symbol='star', color='#f59e0b',
                         line=dict(color=color, width=2)),
-            hovertemplate=f'<b>{short} FORECAST</b><br>%{{x|%Y-%m-%d}}<br>Predicted FRED: %{{y:.4f}}<extra></extra>',
+            hovertemplate=f'<b>{short} FORECAST</b><br>%{{x|%Y-%m-%d}}<br>Predicted FRED: %{{y:.4f}}<br>95% CI: [{fp - ci_half:.4f}, {fp + ci_half:.4f}]<extra></extra>' if ci_half else f'<b>{short} FORECAST</b><br>%{{x|%Y-%m-%d}}<br>Predicted FRED: %{{y:.4f}}<extra></extra>',
         ))
 
     fig.add_hline(y=0,    line_color='gray',    line_dash='dash', line_width=1)
@@ -337,37 +357,62 @@ def panel_theme_scores(weekly):
 
 
 def panel_prediction(predictions, weekly):
-    st.subheader('Model Prediction: FRED in 2 Weeks')
-    if predictions.empty:
-        st.info('No predictions yet. Run train_model.py.')
+    st.subheader('Model Prediction: FRED in 1 Week')
+    if weekly.empty:
+        st.info('No data yet. Run pipeline.py first.')
         return
-    latest = predictions.sort_values('week_start').iloc[-1]
-    pred   = float(latest['predicted_fred_score'])
-    w_act  = predictions.dropna(subset=['actual_fred_score', 'predicted_fred_score'])
-    avg_err = float(w_act['prediction_error'].abs().mean()) if not w_act.empty else None
+
+    model_results  = train_all_models()
+    offset         = pd.Timedelta(weeks=1)
+    last_fred_date = weekly.dropna(subset=['fred_score'])['week_start'].max()
+
+    # Use LinearRegression 1w abs model — find the most recent forecast point
+    key = ('1w', 'LinearRegression', 'abs')
+    if key not in model_results:
+        st.info('1w model not trained yet.')
+        return
+    res       = model_results[key]
+    all_weeks = res['train_weeks'] + res['test_weeks']
+    all_preds = res['train_preds'] + res['test_preds']
+    all_acts  = res['train_actuals'] + res['test_actuals']
+
+    future = [(pd.Timestamp(w) + offset, p)
+              for w, p in zip(all_weeks, all_preds)
+              if pd.Timestamp(w) + offset > last_fred_date]
+    if not future:
+        st.info('No upcoming 1w prediction available.')
+        return
+    forecast_date, pred = future[-1]
+
+    # Avg abs error from test set
+    if res['test_preds'] and res['test_actuals']:
+        avg_err = float(np.mean(np.abs(np.array(res['test_preds']) - np.array(res['test_actuals']))))
+    else:
+        avg_err = None
+
+    cur = float(weekly.dropna(subset=['fred_score'])['fred_score'].iloc[-1])
     c1, c2, c3 = st.columns(3)
-    c1.metric('Predicted FRED (2w)', f'{pred:.4f}')
-    c2.metric('Model version', str(latest.get('model_version', 'v1')))
+    c1.metric('Predicted FRED (1w)', f'{pred:.4f}')
+    c2.metric('For week of', forecast_date.strftime('%Y-%m-%d'))
     if avg_err is not None:
-        c3.metric('Avg abs error', f'+-{avg_err:.4f}')
-    if not weekly.empty:
-        cur = float(weekly.dropna(subset=['fred_score'])['fred_score'].iloc[-1])
-        fig = go.Figure(go.Indicator(
-            mode='gauge+number+delta', value=pred,
-            delta={'reference': cur, 'valueformat': '.4f'},
-            title={'text': f'Predicted FRED<br><sub>current: {cur:.4f}</sub>'},
-            gauge={
-                'axis': {'range': [-3, 3]},
-                'bar': {'color': fred_color(pred)},
-                'steps': [{'range': [-3, -0.5], 'color': '#dcfce7'},
-                          {'range': [-0.5, 0.5], 'color': '#fef9c3'},
-                          {'range': [0.5, 3],    'color': '#fee2e2'}],
-                'threshold': {'line': {'color': 'black', 'width': 3},
-                              'thickness': 0.75, 'value': cur},
-            },
-        ))
-        fig.update_layout(height=280, paper_bgcolor='rgba(0,0,0,0)')
-        st.plotly_chart(fig, use_container_width=True)
+        c3.metric('Avg abs error (test)', f'±{avg_err:.4f}')
+
+    fig = go.Figure(go.Indicator(
+        mode='gauge+number+delta', value=pred,
+        delta={'reference': cur, 'valueformat': '.4f'},
+        title={'text': f'Predicted FRED (1w)<br><sub>current: {cur:.4f}</sub>'},
+        gauge={
+            'axis': {'range': [-3, 3]},
+            'bar': {'color': fred_color(pred)},
+            'steps': [{'range': [-3, -0.5], 'color': '#dcfce7'},
+                      {'range': [-0.5, 0.5], 'color': '#fef9c3'},
+                      {'range': [0.5, 3],    'color': '#fee2e2'}],
+            'threshold': {'line': {'color': 'black', 'width': 3},
+                          'thickness': 0.75, 'value': cur},
+        },
+    ))
+    fig.update_layout(height=280, paper_bgcolor='rgba(0,0,0,0)')
+    st.plotly_chart(fig, use_container_width=True)
 
 
 def panel_divergence(predictions, weekly):
@@ -751,10 +796,6 @@ def main():
             )
         else:
             st.warning('No data yet.')
-        if not predictions.empty:
-            st.divider()
-            st.metric('Predictions made', len(predictions))
-            st.metric('With actuals', int(predictions['actual_fred_score'].notna().sum()))
         st.divider()
         if st.button('Refresh data'):
             st.cache_data.clear()
