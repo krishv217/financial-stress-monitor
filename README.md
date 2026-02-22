@@ -1,10 +1,10 @@
-# Financial Stress Monitor
+# StressPress
 
 A data pipeline and ML system that predicts the St. Louis Fed Financial Stress Index (FRED STLFSI4) using LLM-classified NYT news sentiment. Models are trained across 5 prediction horizons (1–12 weeks) using Linear Regression, Lasso, and Random Forest.
 
 ## Overview
 
-The system collects NYT articles related to financial stress, classifies them by theme and direction using Claude AI, aggregates weekly sentiment scores, and trains ML models to predict future FRED stress index values. The core research question: **how far into the future can news-derived sentiment predict measurable financial stress?**
+StressPress collects NYT articles related to financial stress, classifies them by theme and direction using Claude AI, aggregates weekly sentiment scores, and trains ML models to predict future FRED stress index values. The core research question: **how far into the future can news-derived sentiment predict measurable financial stress?**
 
 ## Project Structure
 

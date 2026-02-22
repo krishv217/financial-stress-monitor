@@ -1,5 +1,5 @@
 """
-Financial Stress Monitor — Dashboard v3
+StressPress — Dashboard v3
 
 Tabs:
   1. Live Monitor  — current FRED, theme scores, 2w prediction, divergence alert
@@ -63,7 +63,7 @@ MODEL_DEFS = [
 
 TRAIN_SPLIT = 0.9
 
-st.set_page_config(page_title='Financial Stress Monitor', page_icon='📊', layout='wide')
+st.set_page_config(page_title='StressPress', page_icon='📊', layout='wide')
 
 
 # ---------------------------------------------------------------------------
@@ -730,7 +730,7 @@ def tab_model_analysis(weekly, model_results):
 # ---------------------------------------------------------------------------
 
 def main():
-    st.title('Financial Stress Monitor')
+    st.title('StressPress')
     st.caption(
         'Narrative-driven early warning system for FRED STLFSI4 | '
         'NYT articles classified by Claude AI | '
