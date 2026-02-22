@@ -24,17 +24,37 @@ load_dotenv()
 
 NYT_BASE_URL = 'https://api.nytimes.com/svc/search/v2/articlesearch.json'
 
-# Load up to 7 API keys: NYT_API_KEY_1 … NYT_API_KEY_7.
-# Falls back to NYT_API_KEY if numbered keys are not set.
-_raw_keys = [os.getenv(f'NYT_API_KEY_{i}') for i in range(1, 8)]
-NYT_API_KEYS = [k for k in _raw_keys if k] or [os.getenv('NYT_API_KEY')]
-NYT_API_KEYS = [k for k in NYT_API_KEYS if k]  # drop any remaining None
+# Load all API keys: NYT_API_KEY plus NYT_API_KEY_1 … NYT_API_KEY_13.
+_raw_keys = [os.getenv('NYT_API_KEY')] + [os.getenv(f'NYT_API_KEY_{i}') for i in range(1, 17)]
+NYT_API_KEYS = [k for k in _raw_keys if k]  # drop any unset keys
 
 # Rotate through keys on every call.
-# With N keys each key is called every N requests, so safe sleep = ceil(6/N).
-# Single key: 7s. Two keys: 3.5s. Five keys: 1.4s. Seven keys: 1.0s.
-SLEEP_SECS = max(1.0, 7 / len(NYT_API_KEYS))
+# NYT limit: 10 req/min per key → 1 req per 6s per key.
+# With N keys, each key is called every N*sleep seconds → sleep >= 6/N.
+SLEEP_SECS = max(0.55, 6 / len(NYT_API_KEYS))
 _key_cycle = itertools.cycle(NYT_API_KEYS)
+
+# Keys marked rate-limited until this timestamp (unix time).
+_rate_limited_until = {}   # key -> float timestamp
+_COOLDOWN = 65             # seconds before a 429'd key is retried
+
+
+def _next_key():
+    """
+    Return the next key that is not currently rate-limited.
+    If every key is exhausted, wait until the soonest one recovers.
+    """
+    now = time.time()
+    for _ in range(len(NYT_API_KEYS)):
+        k = next(_key_cycle)
+        if now >= _rate_limited_until.get(k, 0):
+            return k
+    # All keys rate-limited — wait for the earliest to recover.
+    soonest = min(NYT_API_KEYS, key=lambda k: _rate_limited_until.get(k, 0))
+    wait = max(0, _rate_limited_until[soonest] - time.time())
+    print(f'      All {len(NYT_API_KEYS)} keys rate-limited — waiting {wait:.0f}s...')
+    time.sleep(wait + 1)
+    return next(_key_cycle)
 
 # 10 queries covering all 5 stress themes.
 # Kept to 3 terms each — NYT Article Search API returns null results for
@@ -52,7 +72,7 @@ QUERIES = [
     'stock market OR market volatility OR financial markets', # Q10 equity/broad
 ]
 
-START_DATE = datetime(2024, 12, 30)  # Monday of week containing 12/31/24
+START_DATE = datetime(2024, 12, 27)  # Friday of week containing 12/31/24
 RAW_CSV = 'data/raw_articles.csv'
 FIELDNAMES = [
     'article_id', 'source', 'query_number', 'week_start',
@@ -64,10 +84,12 @@ FIELDNAMES = [
 # Helpers
 # ---------------------------------------------------------------------------
 
-def get_target_weeks():
-    """Generate weekly Monday dates from START_DATE through today."""
-    weeks, d, today = [], START_DATE, datetime.now()
-    while d <= today:
+def get_target_weeks(start=None, end=None):
+    """Generate weekly Friday dates from start through end (defaults: START_DATE, today)."""
+    d = start or START_DATE
+    stop = end or datetime.now()
+    weeks = []
+    while d <= stop:
         weeks.append(d)
         d += timedelta(weeks=1)
     return weeks
@@ -82,28 +104,28 @@ def load_collected_weeks():
 
 
 def fetch_page(query, begin_date, end_date, page):
-    """Fetch one page from NYT Article Search API; retries on rate limits."""
-    params = {
+    """Fetch one page from NYT Article Search API; rotates keys on rate limits."""
+    base_params = {
         'q': query,
         'begin_date': begin_date,
         'end_date': end_date,
         'page': page,
-        'api-key': next(_key_cycle),
     }
     while True:
+        key = _next_key()
         try:
-            r = requests.get(NYT_BASE_URL, params=params, timeout=30)
+            r = requests.get(NYT_BASE_URL, params={**base_params, 'api-key': key}, timeout=30)
             if r.status_code == 429:
-                print('      [429] rate limit — waiting 60s...')
-                time.sleep(60)
-                continue
+                print(f'      [429] key …{key[-6:]} rate-limited — rotating to next key')
+                _rate_limited_until[key] = time.time() + _COOLDOWN
+                continue  # immediately try next key
             r.raise_for_status()
             data = r.json()
             if 'fault' in data:
                 msg = data['fault'].get('faultstring', 'rate limit')
-                print(f'      [fault] {msg} — waiting 60s...')
-                time.sleep(60)
-                continue
+                print(f'      [fault] {msg} — key …{key[-6:]} rate-limited, rotating')
+                _rate_limited_until[key] = time.time() + _COOLDOWN
+                continue  # immediately try next key
             if data.get('status') != 'OK':
                 print(f"      [error] status={data.get('status')}")
                 return []
@@ -158,6 +180,10 @@ def collect_week(week_start):
             print(f'{added} articles')
             time.sleep(SLEEP_SECS)
 
+            # No results on this page → later pages will also be empty
+            if not docs:
+                break
+
     return articles
 
 
@@ -181,6 +207,10 @@ def main():
     parser = argparse.ArgumentParser(description='Collect NYT articles for pipeline')
     parser.add_argument('--test', action='store_true',
                         help='Collect 2 weeks only (smoke test)')
+    parser.add_argument('--start-date', type=str, default=None,
+                        help='Start date (YYYY-MM-DD, must be a Friday). Overrides START_DATE.')
+    parser.add_argument('--end-date', type=str, default=None,
+                        help='End date (YYYY-MM-DD, inclusive). Defaults to today.')
     args = parser.parse_args()
 
     if not NYT_API_KEYS:
@@ -190,7 +220,9 @@ def main():
 
     os.makedirs('data', exist_ok=True)
 
-    weeks = get_target_weeks()
+    start = datetime.strptime(args.start_date, '%Y-%m-%d') if args.start_date else None
+    end = datetime.strptime(args.end_date, '%Y-%m-%d') if args.end_date else None
+    weeks = get_target_weeks(start=start, end=end)
     collected = load_collected_weeks()
     remaining = [w for w in weeks if w.strftime('%Y-%m-%d') not in collected]
 
