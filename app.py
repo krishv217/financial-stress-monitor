@@ -47,17 +47,6 @@ THEME_COLS = {
     'geopolitical_external_score': 'Geopolitical & External',
 }
 
-DAY_COLORS = {
-    'Monday':    '#3b82f6',
-    'Tuesday':   '#8b5cf6',
-    'Wednesday': '#f59e0b',
-    'Thursday':  '#ef4444',
-    'Friday':    '#22c55e',
-    'Saturday':  '#94a3b8',
-    'Sunday':    '#64748b',
-}
-DAY_ORDER = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
-
 HORIZONS = [
     ('1w',  'fred_score_1w_future',  '1 Week Ahead'),
     ('2w',  'fred_score_2w_future',  '2 Weeks Ahead'),
@@ -120,63 +109,6 @@ def load_articles():
     df = df[df['is_relevant'] == 'yes'].copy()
     df['magnitude_score'] = pd.to_numeric(df['magnitude_score'], errors='coerce').fillna(1)
     return df.sort_values(['week_start', 'magnitude_score'], ascending=[True, False])
-
-
-@st.cache_data(ttl=600, show_spinner='Computing daily sentiment...')
-def load_daily_sentiment():
-    """
-    Compute a magnitude-weighted composite stress score for every calendar day
-    that has at least one classified relevant article.
-
-    Returns a DataFrame with columns:
-      pub_date, week_friday, day_name, composite_score, article_count
-    """
-    if not os.path.exists(CLASSIFIED_CSV) or os.path.getsize(CLASSIFIED_CSV) == 0:
-        return pd.DataFrame()
-
-    needed = {'publication_date', 'is_relevant', 'stress_theme',
-              'stress_themes', 'stress_direction', 'magnitude_score'}
-    df = pd.read_csv(CLASSIFIED_CSV, dtype=str,
-                     usecols=lambda c: c in needed).fillna('')
-    df = df[(df['is_relevant'] == 'yes') & (df['stress_theme'] != '')].copy()
-    df['magnitude_score'] = pd.to_numeric(df['magnitude_score'], errors='coerce').fillna(1)
-    df['pub_date'] = pd.to_datetime(df['publication_date'], errors='coerce')
-    df = df.dropna(subset=['pub_date'])
-
-    def _score(row):
-        try:
-            cls_list = json.loads(row['stress_themes']) if row['stress_themes'] else None
-        except Exception:
-            cls_list = None
-        if not cls_list:
-            cls_list = [{'direction': row['stress_direction'],
-                         'magnitude': row['magnitude_score']}]
-        s = 0
-        for c in cls_list:
-            try:
-                mag = max(1, min(3, int(c.get('magnitude', 1))))
-            except Exception:
-                mag = 1
-            d = c.get('direction', 'neutral')
-            s += mag if d == 'increasing' else -mag if d == 'decreasing' else 0
-        return s
-
-    df['score'] = df.apply(_score, axis=1)
-
-    daily = (
-        df.groupby(df['pub_date'].dt.normalize())
-        .agg(composite_score=('score', 'sum'),
-             article_count=('score', 'count'))
-        .reset_index()
-        .rename(columns={'pub_date': 'pub_date'})
-    )
-    daily['pub_date']    = pd.to_datetime(daily['pub_date'])
-    daily['day_name']    = daily['pub_date'].dt.day_name()
-    daily['day_of_week'] = daily['pub_date'].dt.weekday
-    daily['week_friday'] = daily['pub_date'].apply(
-        lambda d: d + pd.Timedelta(days=(4 - d.weekday()) % 7)
-    )
-    return daily.sort_values('pub_date').reset_index(drop=True)
 
 
 # ---------------------------------------------------------------------------
@@ -608,133 +540,6 @@ def panel_recent_articles(articles, weekly):
 
 
 # ---------------------------------------------------------------------------
-# Tab 3: Daily Signal
-# ---------------------------------------------------------------------------
-
-DAILY_HORIZON_OPTS = [
-    ('1 Week Ahead',  'fred_score_1w_future'),
-    ('2 Weeks Ahead', 'fred_score_2w_future'),
-    ('4 Weeks Ahead', 'fred_score_4w_future'),
-]
-
-def panel_daily_sentiment_scatter(weekly):
-    st.subheader('Daily Article Sentiment vs Weekly ΔFRED')
-    st.caption(
-        'Each point is one calendar day of articles. '
-        'X = that day\'s composite stress score (sum of magnitude-weighted directions). '
-        'Y = ΔFRED for the week that day belongs to. '
-        'Color = day of week. Shows whether intra-week timing or article volume drives the signal.'
-    )
-
-    daily = load_daily_sentiment()
-    if daily.empty:
-        st.info('No article data. Enable "Load daily signal" in the sidebar first.')
-        return
-
-    if weekly.empty or 'fred_score_1w_future' not in weekly.columns:
-        st.info('No weekly FRED data yet.')
-        return
-
-    # Horizon picker
-    sel_h_label = st.radio(
-        'ΔFRED horizon:', [h[0] for h in DAILY_HORIZON_OPTS],
-        horizontal=True, key='daily_h_sel',
-    )
-    h_col = dict(DAILY_HORIZON_OPTS)[sel_h_label]
-
-    # Build ΔFRED lookup: week_friday -> delta
-    work = weekly.copy()
-    if h_col not in work.columns:
-        st.info(f'{h_col} not available.')
-        return
-    work['delta'] = work[h_col] - work['fred_score']
-    delta_lookup = work.dropna(subset=['delta']).set_index('week_start')['delta']
-
-    plot_df = daily.copy()
-    plot_df['delta'] = plot_df['week_friday'].map(delta_lookup)
-    plot_df = plot_df.dropna(subset=['delta']).copy()
-
-    if plot_df.empty:
-        st.info('No overlapping daily+FRED data found.')
-        return
-
-    # ── Scatter chart ────────────────────────────────────────────────────────
-    fig = go.Figure()
-
-    for day_name in DAY_ORDER:
-        color = DAY_COLORS[day_name]
-        sub = plot_df[plot_df['day_name'] == day_name]
-        if sub.empty:
-            continue
-        fig.add_trace(go.Scatter(
-            x=sub['composite_score'],
-            y=sub['delta'],
-            mode='markers',
-            name=day_name,
-            marker=dict(color=color, size=6, opacity=0.55),
-            hovertemplate=(
-                f'<b>{day_name}</b><br>'
-                'Date: %{customdata}<br>'
-                'Sentiment: %{x:.1f}<br>'
-                f'ΔFRED ({sel_h_label}): %{{y:.4f}}'
-                '<extra></extra>'
-            ),
-            customdata=sub['pub_date'].dt.strftime('%Y-%m-%d'),
-        ))
-
-    # OLS trend line across all days
-    x_all = plot_df['composite_score'].values
-    y_all = plot_df['delta'].values
-    if len(x_all) > 10:
-        slope, intercept = np.polyfit(x_all, y_all, 1)
-        x_range = np.linspace(x_all.min(), x_all.max(), 200)
-        fig.add_trace(go.Scatter(
-            x=x_range, y=slope * x_range + intercept,
-            mode='lines',
-            name=f'Trend  (slope={slope:.4f})',
-            line=dict(color='#1e293b', width=2.5, dash='dash'),
-            hoverinfo='skip',
-        ))
-        corr = float(np.corrcoef(x_all, y_all)[0, 1])
-        st.caption(
-            f'All days — r = **{corr:.3f}** | slope = {slope:.4f} | n = {len(x_all):,} days'
-        )
-
-    fig.add_hline(y=0, line_color='gray', line_dash='dot', line_width=1)
-    fig.add_vline(x=0, line_color='gray', line_dash='dot', line_width=1)
-
-    fig.update_layout(
-        title=f'Daily Composite Sentiment vs ΔFRED ({sel_h_label})',
-        xaxis_title='Daily Composite Stress Score',
-        yaxis_title=f'ΔFRED — {sel_h_label}',
-        height=520,
-        hovermode='closest',
-        legend=dict(title='Day of week', font_size=11,
-                    orientation='v', x=1.01, y=1),
-        plot_bgcolor='rgba(0,0,0,0)', paper_bgcolor='rgba(0,0,0,0)',
-    )
-    st.plotly_chart(fig, use_container_width=True)
-
-    # ── Per-day-of-week stats table ───────────────────────────────────────────
-    st.markdown('**Correlation by Day of Week**')
-    rows = []
-    for day_name in DAY_ORDER:
-        sub = plot_df[plot_df['day_name'] == day_name]
-        if len(sub) < 5:
-            continue
-        r = float(np.corrcoef(sub['composite_score'], sub['delta'])[0, 1])
-        rows.append({
-            'Day':              day_name,
-            'Days w/ articles': len(sub),
-            'Avg sentiment':    round(float(sub['composite_score'].mean()), 2),
-            'Avg |ΔFRED|':      round(float(sub['delta'].abs().mean()), 4),
-            'Correlation r':    round(r, 3),
-        })
-    if rows:
-        st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
-
-
-# ---------------------------------------------------------------------------
 # Tab 2 main
 # ---------------------------------------------------------------------------
 
@@ -783,14 +588,12 @@ def main():
         st.divider()
         load_arts = st.checkbox('Show recent articles', value=False,
                                 help='Reads classified_articles.csv (~25 MB). Slow on first load.')
-        load_daily = st.checkbox('Show daily signal', value=False,
-                                 help='Computes per-day sentiment from classified_articles.csv.')
         st.divider()
         if st.button('Refresh data'):
             st.cache_data.clear()
             st.rerun()
 
-    tab1, tab2, tab3 = st.tabs(['Live Monitor', 'Model Analysis', 'Daily Signal'])
+    tab1, tab2 = st.tabs(['Live Monitor', 'Model Analysis'])
 
     with tab1:
         panel_fred_trend(weekly)
@@ -813,12 +616,6 @@ def main():
         else:
             model_results = train_all_models()
             tab_model_analysis(weekly, model_results)
-
-    with tab3:
-        if not load_daily:
-            st.info('Enable **"Show daily signal"** in the sidebar to load this tab.')
-        else:
-            panel_daily_sentiment_scatter(weekly)
 
     st.caption(
         f'Refreshed: {datetime.now().strftime("%Y-%m-%d %H:%M")} | '
