@@ -1,6 +1,6 @@
 # Financial Stress Monitor
 
-A data pipeline and ML system that predicts the St. Louis Fed Financial Stress Index (FRED STLFSI4) using LLM-classified NYT news sentiment. Models are trained across 5 prediction horizons (1–12 weeks) using Linear Regression, Lasso, and Random Forest.
+A data pipeline and ML system that predicts the St. Louis Fed Financial Stress Index (FRED STLFSI4) using LLM-classified NYT news sentiment. Models are trained across 5 prediction horizons (1–12 weeks) using Linear Regression, LassoCV, Random Forest, XGBoost, and LightGBM.
 
 ## Overview
 
@@ -116,7 +116,7 @@ Classifies each relevant article into 1–3 stress themes with direction (increa
 python pipeline.py --phase 4
 ```
 
-Groups classified articles by week and computes magnitude-weighted net sentiment scores per theme. Populates 5 future FRED score columns via nearest-date lookup.
+Groups classified articles by week — snapping all week_start dates to Friday to align with FRED's publication cadence — and computes magnitude-weighted net sentiment scores per theme. Populates 5 future FRED score columns via nearest-date lookup.
 
 **FRED horizon columns written:**
 | Column | Offset |
@@ -143,7 +143,7 @@ python pipeline.py --prompt-version v2
 python train_model.py
 ```
 
-Trains **3 models × 5 horizons = 15 combinations** and prints a comparison table:
+Trains **5 models × 5 horizons = 25 combinations** and prints a comparison table:
 
 ```
 Horizon  Model             Train rows  Test rows  Train R²   Test R²     RMSE      MAE
@@ -151,17 +151,23 @@ Horizon  Model             Train rows  Test rows  Train R²   Test R²     RMSE 
 1w       LinearRegression        ...        ...     0.xxx     0.xxx    0.xxxx   0.xxxx
 1w       LassoCV                 ...        ...     0.xxx     0.xxx    0.xxxx   0.xxxx
 1w       RandomForest            ...        ...     0.xxx     0.xxx    0.xxxx   0.xxxx
+1w       XGBoost                 ...        ...     0.xxx     0.xxx    0.xxxx   0.xxxx
+1w       LightGBM                ...        ...     0.xxx     0.xxx    0.xxxx   0.xxxx
 2w       ...
 ```
 
 **Models:**
 - `LinearRegression` — OLS baseline
-- `LassoCV` — L1-regularized regression with automatic alpha selection (5-fold CV); can zero out uninformative features
+- `LassoCV` — L1-regularized regression with automatic alpha selection (5-fold CV); zeros out uninformative features
 - `RandomForest` — 100-tree ensemble, captures non-linear interactions
+- `XGBoost` — gradient-boosted trees (max_depth=3, L1+L2 regularization)
+- `LightGBM` — leaf-wise gradient boosting (max_depth=3); best performer at 4w–12w horizons
 
-**Features:** `monetary_policy_score`, `credit_debt_score`, `banking_liquidity_score`, `inflation_growth_score`, `geopolitical_external_score`, `fred_score`
+**Features (11 total):** 5 current-week theme scores + `fred_score` + 5 lagged (previous week) theme scores
 
-**Train/test split:** chronological 80/20
+**Target:** ΔFRED = `fred_score_{horizon}_future − fred_score` (change, not level); predictions are converted back to absolute FRED for display
+
+**Train/test split:** chronological 90/10 (~1,226 train weeks, ~136 test weeks)
 
 The best model per horizon (by test R²) is saved to `data/model_{horizon}_{name}.pkl`. The best 2-week model is also saved to `data/model.pkl` for dashboard use.
 
@@ -191,9 +197,15 @@ Opens at `http://localhost:8501`
 
 **Magnitude-weighted scoring** — Net score per theme = sum of (+magnitude for increasing, −magnitude for decreasing) across all articles in the week. Neutral articles contribute 0.
 
+**Delta-FRED target** — Models predict the *change* in FRED (ΔFRED = future − current) rather than the absolute level. This forces the model to learn from sentiment rather than just extrapolating autocorrelation, and lets LassoCV/LightGBM zero out the `fred_score` feature when it adds no incremental signal.
+
+**Lagged features** — Previous week's 5 theme scores are appended as additional features, giving the model access to momentum in sentiment signals.
+
 **5 prediction horizons** — Allows comparison of short-term (1–2w) vs medium-term (4–12w) predictability, which is the core research question.
 
-**Nearest-date FRED lookup** — FRED publishes on Fridays; article weeks may start on any day. A ±10-day nearest-match prevents missed joins.
+**Friday normalization** — All week_start dates are snapped to the following Friday before aggregation, aligning the Kaggle dataset (Monday weeks) with the NYT API dataset (Friday weeks) and FRED's publication cadence.
+
+**Nearest-date FRED lookup** — FRED publishes on Fridays. A ±10-day nearest-match prevents missed joins at holiday weeks.
 
 **Backwards collection** — Articles are collected from most recent week backwards, so if the daily quota is exhausted, the most recent (most relevant) data is collected first.
 
@@ -222,6 +234,8 @@ Opens at `http://localhost:8501`
 
 - [FRED STLFSI4](https://fred.stlouisfed.org/series/STLFSI4) — St. Louis Fed Financial Stress Index
 - [NYT Article Search API](https://developer.nytimes.com/docs/articlesearch-product/1/overview) — News source
-- [Claude API](https://anthropic.com) — LLM classification (Haiku)
+- [Claude API](https://anthropic.com) — LLM classification (Haiku relevance filter, Haiku multi-theme classifier)
 - [Streamlit](https://streamlit.io) — Dashboard framework
-- [scikit-learn](https://scikit-learn.org) — ML models
+- [scikit-learn](https://scikit-learn.org) — LinearRegression, LassoCV, RandomForest
+- [XGBoost](https://xgboost.readthedocs.io) — Gradient-boosted trees
+- [LightGBM](https://lightgbm.readthedocs.io) — Leaf-wise gradient boosting
