@@ -117,7 +117,7 @@ def load_articles():
 
 @st.cache_data(ttl=300, show_spinner='Training models...')
 def train_all_models():
-    """Train all 15 model+horizon combos. Returns nested results dict."""
+    """Train delta and absolute models for all horizons. Returns results dict."""
     weekly = load_weekly()
     results = {}
     if weekly.empty:
@@ -136,41 +136,77 @@ def train_all_models():
         train_df = labeled.iloc[:n_train]
         test_df  = labeled.iloc[n_train:]
 
-        X_train, y_train = train_df[FEATURE_COLS].values, train_df[delta_col].values
-        X_test,  y_test  = test_df[FEATURE_COLS].values,  test_df[delta_col].values
+        X_train = train_df[FEATURE_COLS].values
+        X_test  = test_df[FEATURE_COLS].values
+
+        # Forecast row: most recent week with full features but no known future FRED
+        future_rows = work[work[FEATURE_COLS].notna().all(axis=1) & work[delta_col].isna()]
+        weeks_ahead = int(h_label.replace('w', ''))
+        if not future_rows.empty:
+            latest          = future_rows.iloc[-1]
+            X_fc            = latest[FEATURE_COLS].values.reshape(1, -1)
+            forecast_from   = str(latest['week_start'].date())
+            forecast_target = (
+                latest['week_start'] + pd.Timedelta(weeks=weeks_ahead)
+            ).strftime('%Y-%m-%d')
+        else:
+            X_fc = forecast_from = forecast_target = None
 
         for m_name, m_factory, _ in MODEL_DEFS:
-            model = m_factory()
-            model.fit(X_train, y_train)
+            shared = dict(
+                n_train=n_train, n_test=len(test_df),
+                cutoff=str(train_df['week_start'].iloc[-1].date()),
+                train_weeks=train_df['week_start'].dt.strftime('%Y-%m-%d').tolist(),
+                test_weeks=test_df['week_start'].dt.strftime('%Y-%m-%d').tolist(),
+                forecast_from=forecast_from, forecast_target=forecast_target,
+            )
 
-            train_preds = model.predict(X_train)
-            test_preds  = model.predict(X_test) if len(test_df) > 0 else np.array([])
-
-            if len(test_df) > 0:
-                test_r2 = float(r2_score(y_test, test_preds))
-                rmse    = float(np.sqrt(mean_squared_error(y_test, test_preds)))
-                mae     = float(np.mean(np.abs(y_test - test_preds)))
-            else:
-                test_r2 = rmse = mae = float('nan')
-
-            coef = (model.feature_importances_ if hasattr(model, 'feature_importances_')
-                    else model.coef_ if hasattr(model, 'coef_') else np.zeros(len(FEATURE_COLS)))
-
+            # --- Delta model ---
+            y_train_d = train_df[delta_col].values
+            y_test_d  = test_df[delta_col].values
+            model_d   = m_factory()
+            model_d.fit(X_train, y_train_d)
+            tp_d = model_d.predict(X_train)
+            ep_d = model_d.predict(X_test) if len(test_df) > 0 else np.array([])
+            coef_d = (model_d.feature_importances_ if hasattr(model_d, 'feature_importances_')
+                      else model_d.coef_ if hasattr(model_d, 'coef_')
+                      else np.zeros(len(FEATURE_COLS)))
             results[(h_label, m_name)] = {
-                'train_r2':      float(r2_score(y_train, train_preds)),
-                'test_r2':       test_r2,
-                'rmse':          rmse,
-                'mae':           mae,
-                'coef':          coef.tolist(),
-                'n_train':       n_train,
-                'n_test':        len(test_df),
-                'cutoff':        str(train_df['week_start'].iloc[-1].date()),
-                'train_weeks':   train_df['week_start'].dt.strftime('%Y-%m-%d').tolist(),
-                'test_weeks':    test_df['week_start'].dt.strftime('%Y-%m-%d').tolist(),
-                'train_preds':   train_preds.tolist(),
-                'test_preds':    test_preds.tolist(),
-                'train_actuals': y_train.tolist(),
-                'test_actuals':  y_test.tolist(),
+                **shared,
+                'train_r2':      float(r2_score(y_train_d, tp_d)),
+                'test_r2':       float(r2_score(y_test_d, ep_d)) if len(test_df) > 0 else float('nan'),
+                'rmse':          float(np.sqrt(mean_squared_error(y_test_d, ep_d))) if len(test_df) > 0 else float('nan'),
+                'mae':           float(np.mean(np.abs(y_test_d - ep_d))) if len(test_df) > 0 else float('nan'),
+                'coef':          coef_d.tolist(),
+                'train_preds':   tp_d.tolist(),
+                'test_preds':    ep_d.tolist(),
+                'train_actuals': y_train_d.tolist(),
+                'test_actuals':  y_test_d.tolist(),
+                'forecast_delta': float(model_d.predict(X_fc)[0]) if X_fc is not None else None,
+            }
+
+            # --- Absolute model (predicts fred_score_Nw_future directly) ---
+            y_train_a = train_df[h_col].values
+            y_test_a  = test_df[h_col].values
+            model_a   = m_factory()
+            model_a.fit(X_train, y_train_a)
+            tp_a = model_a.predict(X_train)
+            ep_a = model_a.predict(X_test) if len(test_df) > 0 else np.array([])
+            coef_a = (model_a.feature_importances_ if hasattr(model_a, 'feature_importances_')
+                      else model_a.coef_ if hasattr(model_a, 'coef_')
+                      else np.zeros(len(FEATURE_COLS)))
+            results[(h_label, m_name, 'abs')] = {
+                **shared,
+                'train_r2':      float(r2_score(y_train_a, tp_a)),
+                'test_r2':       float(r2_score(y_test_a, ep_a)) if len(test_df) > 0 else float('nan'),
+                'rmse':          float(np.sqrt(mean_squared_error(y_test_a, ep_a))) if len(test_df) > 0 else float('nan'),
+                'mae':           float(np.mean(np.abs(y_test_a - ep_a))) if len(test_df) > 0 else float('nan'),
+                'coef':          coef_a.tolist(),
+                'train_preds':   tp_a.tolist(),
+                'test_preds':    ep_a.tolist(),
+                'train_actuals': y_train_a.tolist(),
+                'test_actuals':  y_test_a.tolist(),
+                'forecast_abs':  float(model_a.predict(X_fc)[0]) if X_fc is not None else None,
             }
     return results
 
@@ -206,20 +242,73 @@ def panel_fred_trend(weekly):
     c2.metric('Status', fred_label(cur))
     c3.metric('As of week', recent['week_start'].iloc[-1].strftime('%Y-%m-%d'))
 
+    model_results  = train_all_models()
+    offset         = pd.Timedelta(weeks=1)
+    last_fred_date = weekly.dropna(subset=['fred_score'])['week_start'].max()
+
     fig = go.Figure()
-    fig.add_trace(go.Bar(
-        x=recent['week_start'], y=recent['fred_score'],
-        marker_color=[fred_color(v) for v in recent['fred_score']],
-        hovertemplate='%{x|%Y-%m-%d}<br>FRED: %{y:.4f}<extra></extra>',
-    ))
+
+    # Actual FRED line — last 12 weeks, placed at target date (week_start + 1w)
+    last_actual_x = last_actual_y = None
+    for m_name, _, _ in MODEL_DEFS:
+        key = ('1w', m_name, 'abs')
+        if key not in model_results:
+            continue
+        res         = model_results[key]
+        all_weeks   = res['train_weeks'] + res['test_weeks']
+        all_actuals = res['train_actuals'] + res['test_actuals']
+        pairs = [(pd.Timestamp(w) + offset, a) for w, a in zip(all_weeks, all_actuals)
+                 if pd.Timestamp(w) + offset <= last_fred_date][-12:]
+        if pairs:
+            tx, ty = zip(*pairs)
+            last_actual_x, last_actual_y = tx[-1], ty[-1]
+            fig.add_trace(go.Scatter(
+                x=list(tx), y=list(ty),
+                mode='lines+markers', name='Actual FRED',
+                line=dict(color='#1e293b', width=2.5),
+                marker=dict(size=5),
+                hovertemplate='%{x|%Y-%m-%d}<br>Actual FRED: %{y:.4f}<extra></extra>',
+            ))
+        break  # actuals identical across models
+
+    # Dotted connector + forecast star — Linear only on front page
+    for m_name, _, color in [m for m in MODEL_DEFS if m[0] == 'LinearRegression']:
+        key = ('1w', m_name, 'abs')
+        if key not in model_results:
+            continue
+        res       = model_results[key]
+        all_weeks = res['train_weeks'] + res['test_weeks']
+        all_preds = res['train_preds'] + res['test_preds']
+        future = [(pd.Timestamp(w) + offset, p) for w, p in zip(all_weeks, all_preds)
+                  if pd.Timestamp(w) + offset > last_fred_date]
+        if not future or last_actual_x is None:
+            continue
+        ft, fp = future[-1]
+        short = m_name.replace('LinearRegression', 'Linear').replace('RandomForest', 'RF')
+        # Dotted line from last actual point to forecast star
+        fig.add_trace(go.Scatter(
+            x=[last_actual_x, ft], y=[last_actual_y, fp],
+            mode='lines', showlegend=False,
+            line=dict(color=color, width=1.5, dash='dot'),
+            hoverinfo='skip',
+        ))
+        # Forecast star
+        fig.add_trace(go.Scatter(
+            x=[ft], y=[fp],
+            mode='markers', name=f'{short} forecast ({ft.strftime("%Y-%m-%d")})',
+            marker=dict(size=14, symbol='star', color='#f59e0b',
+                        line=dict(color=color, width=2)),
+            hovertemplate=f'<b>{short} FORECAST</b><br>%{{x|%Y-%m-%d}}<br>Predicted FRED: %{{y:.4f}}<extra></extra>',
+        ))
+
     fig.add_hline(y=0,    line_color='gray',    line_dash='dash', line_width=1)
     fig.add_hline(y=-0.5, line_color='#22c55e', line_dash='dot',  line_width=1,
                   annotation_text='calm',   annotation_position='bottom right')
     fig.add_hline(y=0.5,  line_color='#ef4444', line_dash='dot',  line_width=1,
                   annotation_text='stress', annotation_position='top right')
-    fig.update_layout(title='12-Week FRED Financial Stress History',
+    fig.update_layout(title='Recent FRED History + Next Week Forecast (1w Model)',
                       xaxis_title='Week', yaxis_title='STLFSI4', height=340,
-                      showlegend=False,
+                      legend=dict(orientation='h', y=1.08, font_size=11),
                       plot_bgcolor='rgba(0,0,0,0)', paper_bgcolor='rgba(0,0,0,0)')
     st.plotly_chart(fig, use_container_width=True)
 
@@ -317,43 +406,47 @@ def panel_divergence(predictions, weekly):
 # Tab 2: Model Analysis helpers
 # ---------------------------------------------------------------------------
 
-def _metrics_table(model_results, h_label):
+def _metrics_table(model_results, h_label, key_suffix=None):
+    def _key(m):
+        return (h_label, m, key_suffix) if key_suffix else (h_label, m)
     rows = []
     best_r2 = max(
-        (model_results[(h_label, m)]['test_r2']
-         for m, _, _ in MODEL_DEFS if (h_label, m) in model_results
-         and not np.isnan(model_results[(h_label, m)]['test_r2'])),
+        (model_results[_key(m)]['test_r2']
+         for m, _, _ in MODEL_DEFS if _key(m) in model_results
+         and not np.isnan(model_results[_key(m)]['test_r2'])),
         default=float('-inf'),
     )
     for m_name, _, color in MODEL_DEFS:
-        key = (h_label, m_name)
+        key = _key(m_name)
         if key not in model_results:
             continue
         res = model_results[key]
         r2 = res['test_r2']
         is_best = not np.isnan(r2) and r2 == best_r2
         rows.append({
-            'Model':     ('* ' if is_best else '  ') + m_name.replace('LinearRegression', 'Linear').replace('RandomForest', 'RF'),
-            'Train R2':  f'{res["train_r2"]:.3f}',
-            'Test R2':   f'{r2:.3f}' if not np.isnan(r2) else 'N/A',
-            'RMSE':      f'{res["rmse"]:.4f}' if not np.isnan(res["rmse"]) else 'N/A',
-            'MAE':       f'{res["mae"]:.4f}' if not np.isnan(res["mae"]) else 'N/A',
-            'n train':   res['n_train'],
-            'n test':    res['n_test'],
+            'Model':    ('* ' if is_best else '  ') + m_name.replace('LinearRegression', 'Linear').replace('RandomForest', 'RF'),
+            'Train R2': f'{res["train_r2"]:.3f}',
+            'Test R2':  f'{r2:.3f}' if not np.isnan(r2) else 'N/A',
+            'RMSE':     f'{res["rmse"]:.4f}' if not np.isnan(res["rmse"]) else 'N/A',
+            'MAE':      f'{res["mae"]:.4f}' if not np.isnan(res["mae"]) else 'N/A',
+            'n train':  res['n_train'],
+            'n test':   res['n_test'],
         })
     if rows:
         st.caption('* = best test R² for this horizon')
         st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
 
 
-def _feature_importance_chart(model_results, h_label):
+def _feature_importance_chart(model_results, h_label, key_suffix=None):
+    def _key(m):
+        return (h_label, m, key_suffix) if key_suffix else (h_label, m)
     sel_model = st.radio(
         'Show feature importance for:',
-        [m for m, _, _ in MODEL_DEFS if (h_label, m) in model_results],
+        [m for m, _, _ in MODEL_DEFS if _key(m) in model_results],
         horizontal=True,
-        key=f'imp_radio_{h_label}',
+        key=f'imp_radio_{h_label}{"_abs" if key_suffix else ""}',
     )
-    key = (h_label, sel_model)
+    key = _key(sel_model)
     if key not in model_results:
         return
     coef = np.array(model_results[key]['coef'])
@@ -391,8 +484,25 @@ def _horizon_scatter(weekly, model_results, h_label, h_col, h_name):
 
     n_train   = max(5, int(len(labeled) * TRAIN_SPLIT))
     cutoff    = labeled['week_start'].iloc[n_train - 1]
-    cutoff_str = str(cutoff.date())
-    x0_str     = str(labeled['week_start'].iloc[0].date())
+
+    # Shift all dates to target date (feature week + N weeks ahead)
+    weeks_ahead   = int(h_label.replace('w', ''))
+    offset        = pd.Timedelta(weeks=weeks_ahead)
+    cutoff_str    = str((cutoff + offset).date())
+    x0_str        = str((labeled['week_start'].iloc[0] + offset).date())
+
+    # Cap actual line at last concretely available FRED reading
+    last_fred_date = weekly.dropna(subset=['fred_score'])['week_start'].max()
+    actual_labeled = labeled[labeled['week_start'] + offset <= last_fred_date]
+
+    # View toggle
+    view_mode = st.radio(
+        'View:',
+        ['ΔFRED (change)', 'Absolute FRED'],
+        horizontal=True,
+        key=f'view_{h_label}',
+    )
+    show_delta = (view_mode == 'ΔFRED (change)')
 
     # --- Full-width scatter chart ---
     fig = go.Figure()
@@ -422,48 +532,107 @@ def _horizon_scatter(weekly, model_results, h_label, h_col, h_name):
         bgcolor='rgba(255,255,255,0.7)',
     )
 
-    # Actual Δfred
-    actual_delta = labeled[delta_col].values
+    if show_delta:
+        actual_y = actual_labeled[delta_col].values
+        actual_name = 'Actual ΔFRED'
+        actual_hover = '%{x|%Y-%m-%d}<br>Actual Δ: %{y:.4f}<extra></extra>'
+        yaxis_title = 'ΔFRED (change from current)'
+        chart_title = f'Predicted vs Actual ΔFRED — {h_name}'
+    else:
+        actual_y = actual_labeled[h_col].values
+        actual_name = 'Actual FRED'
+        actual_hover = '%{x|%Y-%m-%d}<br>Actual FRED: %{y:.4f}<extra></extra>'
+        yaxis_title = 'FRED Stress Index'
+        chart_title = f'Predicted vs Actual FRED — {h_name}'
+
     fig.add_trace(go.Scatter(
-        x=labeled['week_start'], y=actual_delta,
-        mode='lines+markers', name='Actual ΔFRED',
+        x=actual_labeled['week_start'] + offset, y=actual_y,
+        mode='lines+markers', name=actual_name,
         line=dict(color='#1e293b', width=2.5),
         marker=dict(size=5),
-        hovertemplate='%{x|%Y-%m-%d}<br>Actual Δ: %{y:.4f}<extra></extra>',
+        hovertemplate=actual_hover,
     ))
 
-    # Zero line for reference
-    fig.add_hline(y=0, line_color='gray', line_dash='dash', line_width=1)
+    if show_delta:
+        fig.add_hline(y=0, line_color='gray', line_dash='dash', line_width=1)
 
     for m_name, _, color in MODEL_DEFS:
-        key = (h_label, m_name)
+        # Use delta or absolute model results depending on view
+        key = (h_label, m_name) if show_delta else (h_label, m_name, 'abs')
         if key not in model_results:
             continue
         res = model_results[key]
         short = m_name.replace('LinearRegression', 'Linear').replace('RandomForest', 'RF')
 
-        # Train predictions (faded) — already in delta space
+        train_y = res['train_preds']
+        test_y  = res['test_preds']
+        if show_delta:
+            train_hover = f'{short} train Δ: %{{y:.4f}}<extra></extra>'
+            test_hover  = f'%{{x|%Y-%m-%d}}<br>{short} Δ: %{{y:.4f}}<extra></extra>'
+        else:
+            train_hover = f'{short} train FRED: %{{y:.4f}}<extra></extra>'
+            test_hover  = f'%{{x|%Y-%m-%d}}<br>{short} FRED: %{{y:.4f}}<extra></extra>'
+
+        # Shift prediction weeks to target date
+        train_x = [(pd.Timestamp(w) + offset).strftime('%Y-%m-%d') for w in res['train_weeks']]
+        test_x  = [(pd.Timestamp(w) + offset).strftime('%Y-%m-%d') for w in res['test_weeks']]
+
+        # Train predictions (faded)
         fig.add_trace(go.Scatter(
-            x=res['train_weeks'], y=res['train_preds'],
+            x=train_x, y=train_y,
             mode='lines', name=f'{short} (train)',
             line=dict(color=color, width=1.5, dash='dot'),
             opacity=0.6, showlegend=False,
-            hovertemplate=f'{short} train Δ: %{{y:.4f}}<extra></extra>',
+            hovertemplate=train_hover,
         ))
         # Test predictions (bold dashed)
         if res['test_preds']:
             r2_str = f'{res["test_r2"]:.3f}' if not np.isnan(res['test_r2']) else 'N/A'
             fig.add_trace(go.Scatter(
-                x=res['test_weeks'], y=res['test_preds'],
+                x=test_x, y=test_y,
                 mode='lines+markers', name=f'{short}  (test R²={r2_str})',
                 line=dict(color=color, width=2, dash='dash'),
                 marker=dict(size=7, symbol='diamond'),
-                hovertemplate=f'%{{x|%Y-%m-%d}}<br>{short} Δ: %{{y:.4f}}<extra></extra>',
+                hovertemplate=test_hover,
             ))
 
+        # Live forecast star — not shown for 1w horizon
+        if h_label != '1w':
+            if show_delta and res.get('forecast_delta') is not None:
+                star_y   = res['forecast_delta']
+                fc_hover = (
+                    f'<b>{short} FORECAST</b><br>'
+                    f'Target date: {res["forecast_target"]}<br>'
+                    f'Based on week of: {res["forecast_from"]}<br>'
+                    f'Predicted ΔFRED: %{{y:.4f}}<extra></extra>'
+                )
+            elif not show_delta and res.get('forecast_abs') is not None:
+                star_y   = res['forecast_abs']
+                fc_hover = (
+                    f'<b>{short} FORECAST</b><br>'
+                    f'Target date: {res["forecast_target"]}<br>'
+                    f'Based on week of: {res["forecast_from"]}<br>'
+                    f'Predicted FRED: %{{y:.4f}}<extra></extra>'
+                )
+            else:
+                star_y = None
+            if star_y is not None:
+                fig.add_trace(go.Scatter(
+                    x=[res['forecast_target']],
+                    y=[star_y],
+                    mode='markers',
+                    name=f'{short} forecast ({res["forecast_target"]})',
+                    marker=dict(
+                        size=16, symbol='star',
+                        color='#f59e0b',
+                        line=dict(color=color, width=2),
+                    ),
+                    hovertemplate=fc_hover,
+                ))
+
     fig.update_layout(
-        title=f'Predicted vs Actual ΔFRED — {h_name}',
-        xaxis_title='Week', yaxis_title='ΔFRED (change from current)',
+        title=chart_title,
+        xaxis_title='Week', yaxis_title=yaxis_title,
         height=480,
         hovermode='x unified',
         legend=dict(orientation='h', y=1.08, font_size=11),
@@ -472,13 +641,14 @@ def _horizon_scatter(weekly, model_results, h_label, h_col, h_name):
     st.plotly_chart(fig, use_container_width=True)
 
     # --- Metrics + feature importance side by side below the chart ---
+    key_suffix = None if show_delta else 'abs'
     col_metrics, col_imp = st.columns(2)
     with col_metrics:
         st.markdown('**Test Set Metrics**')
-        _metrics_table(model_results, h_label)
+        _metrics_table(model_results, h_label, key_suffix=key_suffix)
     with col_imp:
         st.markdown('**Feature Weights**')
-        _feature_importance_chart(model_results, h_label)
+        _feature_importance_chart(model_results, h_label, key_suffix=key_suffix)
 
 
 def panel_recent_articles(articles, weekly):
@@ -486,7 +656,7 @@ def panel_recent_articles(articles, weekly):
     st.subheader('Recent Articles Driving Sentiment')
 
     if articles.empty:
-        st.info('Enable "Load articles" in the sidebar to see recent articles.')
+        st.info('No classified articles found. Run pipeline.py to populate.')
         return
 
     # Find the most recent week that has both sentiment scores and articles
@@ -551,7 +721,7 @@ def tab_model_analysis(weekly, model_results):
     )
 
     for h_label, h_col, h_name in HORIZONS:
-        with st.expander(f'{h_name}  ({h_label})', expanded=(h_label == '2w')):
+        with st.expander(f'{h_name}  ({h_label})', expanded=True):
             _horizon_scatter(weekly, model_results, h_label, h_col, h_name)
 
 
@@ -586,9 +756,6 @@ def main():
             st.metric('Predictions made', len(predictions))
             st.metric('With actuals', int(predictions['actual_fred_score'].notna().sum()))
         st.divider()
-        load_arts = st.checkbox('Show recent articles', value=False,
-                                help='Reads classified_articles.csv (~25 MB). Slow on first load.')
-        st.divider()
         if st.button('Refresh data'):
             st.cache_data.clear()
             st.rerun()
@@ -597,6 +764,7 @@ def main():
 
     with tab1:
         panel_fred_trend(weekly)
+        panel_divergence(predictions, weekly)
         st.divider()
         left, right = st.columns(2)
         with left:
@@ -604,11 +772,8 @@ def main():
         with right:
             panel_prediction(predictions, weekly)
         st.divider()
-        panel_divergence(predictions, weekly)
-        if load_arts:
-            st.divider()
-            articles = load_articles()
-            panel_recent_articles(articles, weekly)
+        articles = load_articles()
+        panel_recent_articles(articles, weekly)
 
     with tab2:
         if weekly.empty:

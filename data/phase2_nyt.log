@@ -1,0 +1,30 @@
+
+=== Phase 2: Dedup + Relevance Filter ===
+Raw articles   : 60281
+After dedup    : 54782
+New to process : 672
+  Relevance filter 1-30/672
+  Relevance filter 31-60/672
+  Relevance filter 61-90/672
+  Relevance filter 91-120/672
+  Relevance filter 121-150/672
+  Relevance filter 151-180/672
+  Relevance filter 181-210/672
+  Relevance filter 211-240/672
+  Relevance filter 241-270/672
+  Relevance filter 271-300/672
+  Relevance filter 301-330/672
+  Relevance filter 331-360/672
+  Relevance filter 361-390/672
+  Relevance filter 391-420/672
+  Relevance filter 421-450/672
+  Relevance filter 451-480/672
+  Relevance filter 481-510/672
+  Relevance filter 511-540/672
+  Relevance filter 541-570/672
+  Relevance filter 571-600/672
+  Relevance filter 601-630/672
+  Relevance filter 631-660/672
+  Relevance filter 661-672/672
+Relevant: 384/672
+Phase 2 complete.
